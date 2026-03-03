@@ -1,0 +1,314 @@
+
+package main
+
+import (
+	"crypto/x509"
+	"encoding/json"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"path"
+	"time"
+
+	"github.com/hyperledger/fabric-gateway/pkg/client"
+	"github.com/hyperledger/fabric-gateway/pkg/identity"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
+)
+
+// CONFIGURATION
+const (
+	mspID         = "Org1MSP"
+	cryptoPath    = "../../test-network/organizations/peerOrganizations/org1.example.com"
+	certPath      = cryptoPath + "/users/Admin@org1.example.com/msp/signcerts/Admin@org1.example.com-cert.pem"
+	keyPath       = cryptoPath + "/users/Admin@org1.example.com/msp/keystore/"
+	tlsCertPath   = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
+	peerEndpoint  = "localhost:7051"
+	gatewayPeer   = "peer0.org1.example.com"
+	channelName   = "channel1"
+	chaincodeName = "basic"
+)
+
+var contract *client.Contract
+
+// DATA STRUCTURES
+type Asset struct {
+	ID             string `json:"ID"`
+	Color          string `json:"Color"`
+	Size           int    `json:"Size"`
+	Owner          string `json:"Owner"`
+	AppraisedValue int    `json:"AppraisedValue"`
+}
+
+type GBFSResponse struct {
+	LastUpdated int64       `json:"last_updated"`
+	TTL         int         `json:"ttl"`
+	Data        interface{} `json:"data"`
+}
+
+func main() {
+	log.Println("Initializing Fabric Connection...")
+	clientConnection := newGrpcConnection()
+	defer clientConnection.Close()
+
+	id := newIdentity()
+	sign := newSign()
+
+	gateway, err := client.Connect(
+		id,
+		client.WithSign(sign),
+		client.WithClientConnection(clientConnection),
+		client.WithEvaluateTimeout(5*time.Second),
+		client.WithEndorseTimeout(15*time.Second),
+		client.WithSubmitTimeout(5*time.Second),
+		client.WithCommitStatusTimeout(1*time.Minute),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer gateway.Close()
+
+	network := gateway.GetNetwork(channelName)
+	contract = network.GetContract(chaincodeName)
+	log.Println("Blockchain Connected")
+
+	// HTTP SERVER SETUP
+	http.HandleFunc("/gbfs.json", discoveryHandler)
+	http.HandleFunc("/system_information.json", systemInfoHandler)
+	http.HandleFunc("/free_bike_status.json", statusHandler)
+	http.HandleFunc("/api/book", bookHandler)
+	http.HandleFunc("/api/return", returnHandler)
+
+	// Allow CORS
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "OPTIONS" {
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Al	low-Methods", "POST, GET, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			return
+		}
+	})
+
+	log.Println("Middleware Server running on :9000")
+	log.Fatal(http.ListenAndServe(":9000", nil))
+}
+
+// HANDLERS FOR REST
+
+// DISCOVERY
+func discoveryHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	base := "http://localhost:9000"
+	response := GBFSResponse{
+		LastUpdated: time.Now().Unix(),
+		Data: map[string]interface{}{
+			"en": map[string]interface{}{
+				"feeds": []map[string]string{
+					{"name": "system_information", "url": base + "/system_information.json"},
+					{"name": "free_bike_status", "url": base + "/free_bike_status.json"},
+				},
+			},
+		},
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// SYSTEM INFO
+func systemInfoHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	response := GBFSResponse{
+		LastUpdated: time.Now().Unix(),
+		Data: map[string]interface{}{
+			"system_id": "thesis_car_share",
+			"name":      "Thesis Car Sharing (Blockchain Powered)",
+		},
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+// STATUS
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	log.Println("Querying Ledger for Cars...")
+
+	// EvaluateTransaction
+	result, err := contract.EvaluateTransaction("GetAllAssets")
+	if err != nil {
+		http.Error(w, "Blockchain Query Failed: "+err.Error(), 500)
+		return
+	}
+
+	var assets []Asset
+	json.Unmarshal(result, &assets)
+
+	// --- DEBUG PRINT START ---
+	log.Println("--- DEBUGGING ASSETS ---")
+	for _, a := range assets {
+		log.Printf("Found Asset: ID=%s, Color=%s", a.ID, a.Color)
+	}
+	log.Println("------------------------")
+	// Convert to GBFS
+	bikes := make([]map[string]interface{}, 0)
+
+	// Hardcoded locations for demo purposes
+	locs := map[string][2]float64{
+		"CAR_001": {46.2512, 20.1458},
+		"CAR_002": {46.2550, 20.1500},
+	}
+
+	for _, asset := range assets {
+		// Only show AVAILABLE cars
+		if asset.Color == "AVAILABLE" {
+			coords, exists := locs[asset.ID]
+			if !exists {
+				continue
+			}
+
+			bikes = append(bikes, map[string]interface{}{
+				"bike_id":     asset.ID,
+				"lat":         coords[0],
+				"lon":         coords[1],
+				"is_reserved": 0,
+				"is_disabled": 0,
+			})
+		}
+	}
+
+	json.NewEncoder(w).Encode(GBFSResponse{
+		LastUpdated: time.Now().Unix(),
+		Data:        map[string]interface{}{"bikes": bikes},
+	})
+}
+
+// BOOKING
+func bookHandler(w http.ResponseWriter, r *http.Request) {
+	// Set the headers
+	enableCors(&w)
+
+	//  Handle the Preflight (OPTIONS) request explicitly
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	//  Enforce POST for actual bookings
+	if r.Method != "POST" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req struct {
+		VehicleID string `json:"vehicleId"`
+		UserID    string `json:"userId"`
+	}
+
+	// Decode the JSON body
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Transaction: User %s booking %s...", req.UserID, req.VehicleID)
+
+	// Submit to blockchain
+	_, err := contract.SubmitTransaction("UpdateAsset", req.VehicleID, "BOOKED", "5", req.UserID, "100")
+
+	if err != nil {
+		log.Println("Booking Failed:", err)
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": false, "error": err.Error()})
+		return
+	}
+
+	log.Println("Booking Confirmed on Ledger!")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "txId": "TX_REAL_FABRIC"})
+}
+
+func enableCors(w *http.ResponseWriter) {
+	(*w).Header().Set("Access-Control-Allow-Origin", "*")
+	(*w).Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+	(*w).Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+}
+
+func newGrpcConnection() *grpc.ClientConn {
+	certificate, err := loadCertificate(tlsCertPath)
+	if err != nil {
+		panic(err)
+	}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(certificate)
+	transportCredentials := credentials.NewClientTLSFromCert(certPool, gatewayPeer)
+	connection, err := grpc.Dial(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
+	if err != nil {
+		panic(err)
+	}
+	return connection
+}
+
+func newIdentity() *identity.X509Identity {
+	certificate, err := loadCertificate(certPath)
+	if err != nil {
+		panic(err)
+	}
+	id, err := identity.NewX509Identity(mspID, certificate)
+	if err != nil {
+		panic(err)
+	}
+	return id
+}
+
+func newSign() identity.Sign {
+	files, err := ioutil.ReadDir(keyPath)
+	if err != nil {
+		panic(err)
+	}
+	privateKeyPEM, err := ioutil.ReadFile(path.Join(keyPath, files[0].Name()))
+	if err != nil {
+		panic(err)
+	}
+	privateKey, err := identity.PrivateKeyFromPEM(privateKeyPEM)
+	if err != nil {
+		panic(err)
+	}
+	sign, err := identity.NewPrivateKeySign(privateKey)
+	if err != nil {
+		panic(err)
+	}
+	return sign
+}
+
+func loadCertificate(filename string) (*x509.Certificate, error) {
+	certificatePEM, err := ioutil.ReadFile(filename)
+	if err != nil {
+		return nil, err
+	}
+	return identity.CertificateFromPEM(certificatePEM)
+}
+
+// Add this function
+func returnHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	if r.Method != "POST" {
+		return
+	}
+
+	var req struct {
+		VehicleID string `json:"vehicleId"`
+	}
+	json.NewDecoder(r.Body).Decode(&req)
+
+	log.Printf("Transaction: Ending Trip for %s...", req.VehicleID)
+
+	// Set Color back to "AVAILABLE"
+	_, err := contract.SubmitTransaction("UpdateAsset", req.VehicleID, "AVAILABLE", "5", "ThesisOwner", "100")
+
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	log.Println("Trip Ended. Car is AVAILABLE on Ledger.")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
