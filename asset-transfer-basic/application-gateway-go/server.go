@@ -21,7 +21,7 @@ import (
 // 1. DATA STRUCTURES & CONFIG
 // ==========================================
 
-// 🔐 Secure Secret Management
+// Secure Secret Management
 func getJWTSecret() []byte {
         secret := os.Getenv("JWT_SECRET")
         if secret == "" {
@@ -162,12 +162,16 @@ func main() {
 
         http.HandleFunc("/api/register", registerHandler)
         http.HandleFunc("/api/create-asset", createAssetHandler)
+        http.HandleFunc("/api/admin/approve-asset", approveAssetHandler)
+        http.HandleFunc("/api/admin/pending", getPendingAssetsHandler)
 
         log.Println("Server listening on port 9000...")
         if err := http.ListenAndServe("0.0.0.0:9000", nil); err != nil {
                 log.Fatal(err)
         }
 }
+
+
 
 func initDB() {
         var err error
@@ -219,7 +223,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
                 // testing password
 				
                 adminPin := os.Getenv("ADMIN_PIN")
-				fmt.Printf("🚨 DEBUG LOGIN - Received Pass: '%s' | Expected Pass: '%s'\n", req.Password, adminPin)
+		// fmt.Printf("🚨 DEBUG LOGIN - Received Pass: '%s' | Expected Pass: '%s'\n", req.Password, adminPin)
                 if adminPin == "" { adminPin = "admin123" } // Fallback for prototype
 
                 if req.Password != adminPin {
@@ -491,8 +495,7 @@ func registerHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ⛓️ Submit transaction to Hyperledger Fabric: RegisterUser(UserID, InitialBalance)
-	// We matched the exact name and 2 arguments from your smart contract!
+	
 	_, err := contract.SubmitTransaction("RegisterUser", req.UserID, fmt.Sprintf("%d", req.InitialBalance))
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "Failed to register on blockchain: %v"}`, err), http.StatusInternalServerError)
@@ -534,8 +537,7 @@ func createAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// ⛓️ Submit transaction to Hyperledger Fabric: 
-	// CreateAsset(ID, Type, FuelType, Owner, Price, CO2Rate)
+	
 	_, err = contract.SubmitTransaction("CreateAsset", req.ID, req.Type, req.FuelType, ownerID, fmt.Sprintf("%d", req.Price), fmt.Sprintf("%d", req.CO2Rate))
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "Failed to mint asset on blockchain: %v"}`, err), http.StatusInternalServerError)
@@ -547,6 +549,80 @@ func createAssetHandler(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": fmt.Sprintf("Vehicle %s minted successfully by %s. Pending Admin Approval.", req.ID, ownerID),
 	})
+}
+
+func approveAssetHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	// 1. Authenticate the user from the JWT Token
+	claims, err := verifyJWT(r)
+	if err != nil {
+		http.Error(w, `{"error": "Unauthorized: Invalid or missing token"}`, http.StatusUnauthorized)
+		return
+	}
+	adminID := claims.UserID // We will pass this to the smart contract
+
+	// 2. Parse the vehicle ID from the React request
+	var req struct {
+		VehicleID string `json:"vehicleId"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 3. Submit transaction to Hyperledger Fabric: ApproveAsset(adminID, assetID)
+	_, err = contract.SubmitTransaction("ApproveAsset", adminID, req.VehicleID)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to approve asset: %v"}`, err), http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Return success
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"message": fmt.Sprintf("Vehicle %s has been approved and is now AVAILABLE on the map!", req.VehicleID),
+	})
+}
+
+//  Handles Fetching Pending Vehicles for the Admin
+func getPendingAssetsHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	claims, err := verifyJWT(r)
+	if err != nil || claims.Role != "ADMIN" {
+		http.Error(w, `{"error": "Unauthorized: Admin access required"}`, http.StatusUnauthorized)
+		return
+	}
+
+	result, err := contract.EvaluateTransaction("GetAllAssets")
+	if err != nil {
+		http.Error(w, "Failed to read blockchain", http.StatusInternalServerError)
+		return
+	}
+
+	var allAssets []ChaincodeAsset
+	if err := json.Unmarshal(result, &allAssets); err != nil {
+		http.Error(w, "Error parsing data", http.StatusInternalServerError)
+		return
+	}
+
+	// 3. Filter only PENDING assets
+	var pendingAssets []ChaincodeAsset
+	for _, asset := range allAssets {
+		if asset.Status == "PENDING" {
+			pendingAssets = append(pendingAssets, asset)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(pendingAssets)
 }
 
 func enableCors(w *http.ResponseWriter) {
