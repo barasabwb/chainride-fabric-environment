@@ -7,6 +7,7 @@ import (
         "log"
         "net/http"
         "os"
+        "io"
         "path/filepath"
         "strings"
         "time"
@@ -102,7 +103,7 @@ type ChaincodeAsset struct {
 
 type LoginRequest struct {
         UserID   string `json:"userId"`
-        Password string `json:"password"` // 🛡️ Used only for Admin logins
+        Password string `json:"password"`
 }
 type RentRequest struct {
         VehicleID string `json:"vehicleId"`
@@ -165,6 +166,8 @@ func main() {
         http.HandleFunc("/api/admin/approve-asset", approveAssetHandler)
         http.HandleFunc("/api/admin/pending", getPendingAssetsHandler)
 
+        http.HandleFunc("/api/eco", getEcoStatsHandler)
+
         log.Println("Server listening on port 9000...")
         if err := http.ListenAndServe("0.0.0.0:9000", nil); err != nil {
                 log.Fatal(err)
@@ -174,31 +177,161 @@ func main() {
 
 
 func initDB() {
-        var err error
-        db, err = sql.Open("sqlite3", "./offchain_metadata.db")
-        if err != nil {
-                log.Fatalf("Failed to open SQLite database: %v", err)
-        }
+	var err error
+	db, err = sql.Open("sqlite3", "./offchain_metadata.db")
+	if err != nil {
+		log.Fatalf("Failed to open SQLite database: %v", err)
+	}
 
-        createTableQuery := `
-        CREATE TABLE IF NOT EXISTS vehicle_metadata (
-                id TEXT PRIMARY KEY,
-                latitude REAL,
-                longitude REAL
-        );`
-        if _, err := db.Exec(createTableQuery); err != nil {
-                log.Fatalf("Fatal Error creating SQLite table: %v", err)
-        }
+	// Enable foreign key enforcement
+	_, err = db.Exec("PRAGMA foreign_keys = ON")
+	if err != nil {
+		log.Fatalf("Failed to enable foreign keys: %v", err)
+	}
 
-        seedQuery := `
-        INSERT OR IGNORE INTO vehicle_metadata (id, latitude, longitude) VALUES 
-        ('CAR_001', 46.2512, 20.1458),
-        ('SCOOTER_001', 46.2530, 20.1410),
-        ('BIKE_001', 46.2550, 20.1500);
-        `
-        if _, err := db.Exec(seedQuery); err != nil {
-                log.Fatalf("Fatal Error seeding SQLite data: %v", err)
-        }
+	// 1. USERS (Merged with our KYC requirements)
+	createUsersTable := `
+	CREATE TABLE IF NOT EXISTS users (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		email TEXT UNIQUE NOT NULL,
+		password_hash TEXT NOT NULL,
+		phone_number TEXT,
+		dob DATE,
+		license_number TEXT,
+		license_pic_path TEXT,
+		is_verified BOOLEAN DEFAULT 0,
+		reputation_score REAL DEFAULT 5.0,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);`
+	if _, err := db.Exec(createUsersTable); err != nil {
+		log.Fatalf("Error creating users table: %v", err)
+	}
+
+	// 2. VEHICLES (Using TEXT for Web3 ID Mapping)
+	createVehiclesTable := `
+	CREATE TABLE IF NOT EXISTS vehicles (
+		id TEXT PRIMARY KEY,
+		owner_id TEXT NOT NULL,
+		make TEXT,
+		model TEXT,
+		year INTEGER,
+		vehicle_type TEXT, 
+		seats INTEGER,
+		fuel_capacity REAL,
+		fuel_level REAL,
+		battery_capacity REAL,
+		battery_level REAL,
+		consumption_per_100km REAL,
+		avg_rating REAL DEFAULT 5.0,
+		latitude REAL,
+		longitude REAL,
+		available BOOLEAN DEFAULT 1,
+		co2_savings_rate INTEGER,
+		FOREIGN KEY(owner_id) REFERENCES users(id)
+	);`
+	if _, err := db.Exec(createVehiclesTable); err != nil {
+		log.Fatalf("Error creating vehicles table: %v", err)
+	}
+
+	// 3. TRIPS
+	createTripsTable := `
+	CREATE TABLE IF NOT EXISTS trips (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		driver_id TEXT,
+		vehicle_id TEXT,
+		start_lat REAL,
+		start_lon REAL,
+		end_lat REAL,
+		end_lon REAL,
+		distance_km REAL,
+		fuel_used REAL,
+		battery_used REAL,
+		co2_emitted REAL,
+		co2_saved REAL,
+		start_time DATETIME,
+		end_time DATETIME,
+		status TEXT,
+		FOREIGN KEY(driver_id) REFERENCES users(id),
+		FOREIGN KEY(vehicle_id) REFERENCES vehicles(id)
+	);`
+	if _, err := db.Exec(createTripsTable); err != nil {
+		log.Fatalf("Error creating trips table: %v", err)
+	}
+
+	// 4. USER RATINGS
+	createUserRatings := `
+	CREATE TABLE IF NOT EXISTS user_ratings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		rater_id TEXT,
+		rated_user_id TEXT,
+		trip_id INTEGER,
+		rating INTEGER CHECK(rating BETWEEN 1 AND 5),
+		comment TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(rater_id) REFERENCES users(id),
+		FOREIGN KEY(rated_user_id) REFERENCES users(id),
+		FOREIGN KEY(trip_id) REFERENCES trips(id)
+	);`
+	if _, err := db.Exec(createUserRatings); err != nil {
+		log.Fatalf("Error creating user_ratings: %v", err)
+	}
+
+	// 5. VEHICLE RATINGS
+	createVehicleRatings := `
+	CREATE TABLE IF NOT EXISTS vehicle_ratings (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id TEXT,
+		vehicle_id TEXT,
+		trip_id INTEGER,
+		rating INTEGER CHECK(rating BETWEEN 1 AND 5),
+		comment TEXT,
+		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+		FOREIGN KEY(user_id) REFERENCES users(id),
+		FOREIGN KEY(vehicle_id) REFERENCES vehicles(id),
+		FOREIGN KEY(trip_id) REFERENCES trips(id)
+	);`
+	if _, err := db.Exec(createVehicleRatings); err != nil {
+		log.Fatalf("Error creating vehicle_ratings: %v", err)
+	}
+
+	// 6. ECO STATISTICS
+	createEcoStats := `
+	CREATE TABLE IF NOT EXISTS eco_stats (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		user_id TEXT,
+		total_trips INTEGER DEFAULT 0,
+		total_distance REAL DEFAULT 0,
+		total_co2_saved REAL DEFAULT 0,
+		FOREIGN KEY(user_id) REFERENCES users(id)
+	);`
+	if _, err := db.Exec(createEcoStats); err != nil {
+		log.Fatalf("Error creating eco_stats: %v", err)
+	}
+
+	// ---------------- SEED DATA ----------------
+	// Important: Users must be inserted BEFORE vehicles due to Foreign Keys!
+	seedUsers := `
+	INSERT OR IGNORE INTO users (id, name, email, password_hash) VALUES 
+	('admin', 'Admin User', 'admin@chainride.com', 'adminpass'),
+	('Anna', 'Anna Smith', 'anna@example.com', 'userpass1'),
+	('Brian', 'Brian Jones', 'brian@example.com', 'userpass2');
+	`
+	if _, err := db.Exec(seedUsers); err != nil {
+		log.Fatalf("Error seeding users: %v", err)
+	}
+
+	seedVehicles := `
+	INSERT OR IGNORE INTO vehicles (id, owner_id, make, model, vehicle_type, latitude, longitude, co2_savings_rate) VALUES 
+	('CAR_001', 'Anna', 'Tesla', 'Model 3', 'electric', 46.2512, 20.1458, 100),
+	('SCOOTER_001', 'Brian', 'Xiaomi', 'M365', 'electric', 46.2530, 20.1410, 130),
+	('BIKE_001', 'admin', 'Trek', 'FX1', 'human', 46.2550, 20.1500, 150);
+	`
+	if _, err := db.Exec(seedVehicles); err != nil {
+		log.Fatalf("Error seeding vehicles: %v", err)
+	}
+
+	log.Println("✅ SQLite Database initialized successfully with Web3-mapped relational schema.")
 }
 
 // AUTHENTICATION (JWT)
@@ -223,8 +356,8 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
                 // testing password
 				
                 adminPin := os.Getenv("ADMIN_PIN")
-		// fmt.Printf("🚨 DEBUG LOGIN - Received Pass: '%s' | Expected Pass: '%s'\n", req.Password, adminPin)
-                if adminPin == "" { adminPin = "admin123" } // Fallback for prototype
+		// fmt.Printf(" DEBUG LOGIN - Received Pass: '%s' | Expected Pass: '%s'\n", req.Password, adminPin)
+                if adminPin == "" { adminPin = "admin123" } 
 
                 if req.Password != adminPin {
                         http.Error(w, `{"error": "Forbidden: Invalid Admin Credentials"}`, 403)
@@ -274,7 +407,7 @@ func getEffectiveUser(r *http.Request) string {
 
         claims := &Claims{}
         token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
-                // 🛡️ SECURITY: Enforce HS256 algorithm
+                //  Enforce HS256 algorithm
                 if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
                         return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
                 }
@@ -309,7 +442,7 @@ func getGeoJSONFeed(w http.ResponseWriter, r *http.Request) {
                 if asset.Status != "AVAILABLE" { continue }
 
                 var lat, lon float64
-                err := db.QueryRow("SELECT latitude, longitude FROM vehicle_metadata WHERE id = ?", asset.ID).Scan(&lat, &lon)
+                err := db.QueryRow("SELECT latitude, longitude FROM vehicles WHERE id = ?", asset.ID).Scan(&lat, &lon)
                 if err != nil {
                         log.Printf("Warning: Missing GPS data for %s, applying Szeged city center fallback", asset.ID)
                         lat, lon = 46.2530, 20.1414 
@@ -388,6 +521,7 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
+        // 1. Execute the Blockchain Transaction FIRST (The source of truth for payment & state)
         result, err := contract.SubmitTransaction("ReturnAsset", req.VehicleID, effectiveUser)
         if err != nil {
                 w.WriteHeader(500)
@@ -395,7 +529,57 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "receipt": string(result)})
+        // 2. 📊 HYBRID DATA LOGGING: If blockchain succeeds, save the analytics to SQLite
+        
+        // A. Fetch the vehicle's CO2 rating from SQLite
+        var co2Rate float64
+        err = db.QueryRow("SELECT co2_savings_rate FROM vehicles WHERE id = ?", req.VehicleID).Scan(&co2Rate)
+        if err != nil {
+                log.Printf("Warning: Could not find CO2 rate for vehicle %s. Defaulting to 100g/min.", req.VehicleID)
+                co2Rate = 100.0 // Fallback
+        }
+
+        // For this prototype, we will log a flat estimate (e.g., assuming an average 15-minute ride for demo purposes)
+        // In a production app, you would parse the exact duration from the smart contract 'result' receipt.
+        estimatedDurationMins := 15.0 
+        totalCO2Saved := co2Rate * estimatedDurationMins
+
+        // B. Log the completed trip into the 'trips' table
+        insertTripQuery := `
+                INSERT INTO trips (driver_id, vehicle_id, co2_saved, end_time, status) 
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP, 'COMPLETED')
+        `
+        _, err = db.Exec(insertTripQuery, effectiveUser, req.VehicleID, totalCO2Saved)
+        if err != nil {
+                log.Printf("SQLite Error logging trip: %v", err)
+        }
+
+        // C. Update the user's lifetime Eco-Stats (With Smart Upsert!)
+        updateEcoQuery := `
+                UPDATE eco_stats 
+                SET total_trips = total_trips + 1, 
+                    total_co2_saved = total_co2_saved + ? 
+                WHERE user_id = ?
+        `
+        res, err := db.Exec(updateEcoQuery, totalCO2Saved, effectiveUser)
+        if err == nil {
+                // Check if the UPDATE actually found a row to change
+                rowsAffected, _ := res.RowsAffected()
+                if rowsAffected == 0 {
+                        // The user didn't have an eco_stats profile yet! Let's create one.
+                        insertNewEcoQuery := `INSERT INTO eco_stats (user_id, total_trips, total_co2_saved) VALUES (?, 1, ?)`
+                        db.Exec(insertNewEcoQuery, effectiveUser, totalCO2Saved)
+                }
+        } else {
+                log.Printf("SQLite Error updating eco stats: %v", err)
+        }
+
+        // 3. Return the successful receipt to the React frontend
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(map[string]interface{}{
+                "success": true, 
+                "receipt": string(result),
+        })
 }
 
 func getWalletHandler(w http.ResponseWriter, r *http.Request) {
@@ -439,7 +623,7 @@ func topUpHandler(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        // 🛡️ SECURITY: Demo Faucet Limit (Max $5000 per request)
+        //  Demo Faucet Limit (Max $5000 per request)
         if req.Amount > 5000 {
                 http.Error(w, `{"error": "Faucet limit exceeded. Maximum request is 5000 tokens."}`, 400)
                 return
@@ -478,34 +662,95 @@ func getHistoryHandler(w http.ResponseWriter, r *http.Request) {
 
 func registerHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
-
 	if r.Method == "OPTIONS" {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-
-	var req struct {
-		UserID         string `json:"userId"`
-		Password       string `json:"password"`
-		InitialBalance int    `json:"initialBalance"`
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, `{"error": "Invalid request body"}`, http.StatusBadRequest)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	
-	_, err := contract.SubmitTransaction("RegisterUser", req.UserID, fmt.Sprintf("%d", req.InitialBalance))
+	// 1. Parse the multipart form (Max upload size: 10MB)
+	err := r.ParseMultipartForm(10 << 20)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 2. Extract Text Fields from React FormData
+	userID := r.FormValue("username") // This acts as the ID for both Web3 and SQLite
+	password := r.FormValue("password") // In a real production app, you would hash this!
+	email := r.FormValue("email")
+	fullName := r.FormValue("fullName")
+	phoneNumber := r.FormValue("phoneNumber")
+	dob := r.FormValue("dob")
+	licenseNum := r.FormValue("licenseNumber")
+
+	if userID == "" || password == "" || email == "" {
+		http.Error(w, `{"error": "Missing critical fields (username, password, email)"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 3. Handle the License Image Upload
+	file, handler, err := r.FormFile("licenseImage")
+	var imagePath string
+
+	if err == nil {
+		defer file.Close()
+		// Create a unique filename (e.g., jsmith88_1709999999.png)
+		filename := fmt.Sprintf("%s_%d%s", userID, time.Now().Unix(), filepath.Ext(handler.Filename))
+		imagePath = filepath.Join("uploads", filename)
+
+		// Save physical file to your VM
+		dst, err := os.Create(imagePath)
+		if err != nil {
+			log.Printf("Error creating file: %v", err)
+			http.Error(w, `{"error": "Failed to save image"}`, http.StatusInternalServerError)
+			return
+		}
+		defer dst.Close()
+		if _, err := io.Copy(dst, file); err != nil {
+			http.Error(w, `{"error": "Failed to write image"}`, http.StatusInternalServerError)
+			return
+		}
+	} else if err != http.ErrMissingFile {
+		http.Error(w, `{"error": "Error reading uploaded file"}`, http.StatusBadRequest)
+		return
+	}
+
+	// 4. Create the Web3 Identity on Hyperledger Fabric
+	_, err = contract.SubmitTransaction("RegisterUser", userID, "0")
 	if err != nil {
 		http.Error(w, fmt.Sprintf(`{"error": "Failed to register on blockchain: %v"}`, err), http.StatusInternalServerError)
 		return
 	}
 
-	// Return success back to React
+	// 5. Save the off-chain data to the new 'users' table
+	insertUserQuery := `
+		INSERT INTO users (id, name, email, password_hash, phone_number, dob, license_number, license_pic_path) 
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = db.Exec(insertUserQuery, userID, fullName, email, password, phoneNumber, dob, licenseNum, imagePath)
+	if err != nil {
+		log.Printf("SQLite Error (Users Table): %v", err)
+		http.Error(w, `{"error": "Failed to save user profile"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// 6. Initialize their Eco-Stats profile (Ready for their first trip!)
+	insertEcoQuery := `INSERT INTO eco_stats (user_id) VALUES (?)`
+	_, err = db.Exec(insertEcoQuery, userID)
+	if err != nil {
+		log.Printf("SQLite Error (Eco Stats Table): %v", err)
+		// We log the error but don't crash the registration over it
+	}
+
+	// 7. Return Success to React
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"success": true,
-		"message": fmt.Sprintf("Wallet created for %s with %d tokens", req.UserID, req.InitialBalance),
+		"message": "Welcome to ChainRide! Your profile is under review.",
 	})
 }
 
@@ -623,6 +868,36 @@ func getPendingAssetsHandler(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(pendingAssets)
+}
+
+func getEcoStatsHandler(w http.ResponseWriter, r *http.Request) {
+        enableCors(&w)
+        if r.Method == "OPTIONS" { return }
+
+        // Securely get the user from the JWT token
+        effectiveUser := getEffectiveUser(r)
+        if effectiveUser == "" {
+                http.Error(w, `{"error": "Unauthorized"}`, 401)
+                return
+        }
+
+        var totalTrips int
+        var totalCO2 float64
+        
+        // Query the SQLite database for this user's specific eco impact
+        err := db.QueryRow("SELECT total_trips, total_co2_saved FROM eco_stats WHERE user_id = ?", effectiveUser).Scan(&totalTrips, &totalCO2)
+        
+        w.Header().Set("Content-Type", "application/json")
+        if err != nil {
+                // If they have no trips yet, just return 0
+                json.NewEncoder(w).Encode(map[string]interface{}{"totalTrips": 0, "totalCo2Saved": 0})
+                return
+        }
+
+        json.NewEncoder(w).Encode(map[string]interface{}{
+                "totalTrips": totalTrips,
+                "totalCo2Saved": totalCO2,
+        })
 }
 
 func enableCors(w *http.ResponseWriter) {
