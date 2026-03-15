@@ -2,3 +2,19 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 #
+version: '2'
+
+services:
+  couchdb.org3.example.com:
+    container_name: couchdb.org3.example.com
+    image: couchdb:3.1
+    environment:
+      - COUCHDB_USER=admin
+      - COUCHDB_PASSWORD=password
+    ports:
+      - "5986:5984"
+    volumes:
+      - couchdb.org3:/opt/couchdb/data
+
+volumes:
+  couchdb.org3:

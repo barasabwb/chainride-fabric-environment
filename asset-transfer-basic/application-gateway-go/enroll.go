@@ -25,7 +25,7 @@ func main() {
 
 		// 3. Read the Certificate
 		// Note: The file is named "Admin@org1.example.com-cert.pem"
-		certPath := filepath.Join(credPath, "signcerts", "cert.pem")
+		certPath := filepath.Join(credPath, "signcerts", "Admin@org1.example.com-cert.pem")
 		cert, err := os.ReadFile(certPath)
 		if err != nil {
 			log.Fatalf("Failed to read certificate: %v", err)
