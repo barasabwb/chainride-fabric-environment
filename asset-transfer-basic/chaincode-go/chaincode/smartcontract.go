@@ -47,7 +47,7 @@ type Asset struct {
 	BatteryLevel   string `json:"BatteryLevel"`
 	Owner          string `json:"Owner"`
 	Status         string `json:"Status"`
-	PricePerMinute int64  `json:"PricePerMinute"`
+	PricePerKm     int64  `json:"PricePerKm"`
 	StartTime      int64  `json:"StartTime"`
 	CurrentRenter  string `json:"CurrentRenter"`
 	CO2SavingsRate int64  `json:"CO2SavingsRate"`
@@ -99,8 +99,8 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 	}
 
 	assets := []Asset{
-		{ID: "CAR_001", Type: "Car", Make: "Tesla", Model: "Model 3", CarClass: "Sedan", Transmission: "Automatic", Seats: 5, Mileage: "14,500 km", FuelType: "Electric", BatteryLevel: "84%", Owner: "Anna", Status: "AVAILABLE", PricePerMinute: 8, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 100, BaseLatMicro: 46252100, BaseLonMicro: 20141000},
-		{ID: "SCOOTER_001", Type: "Scooter", Make: "Xiaomi", Model: "M365", CarClass: "Micro", Transmission: "N/A", Seats: 1, Mileage: "850 km", FuelType: "Electric", BatteryLevel: "100%", Owner: "Brian", Status: "AVAILABLE", PricePerMinute: 3, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 130, BaseLatMicro: 46253000, BaseLonMicro: 20141400},
+		{ID: "CAR_001", Type: "Car", Make: "Tesla", Model: "Model 3", CarClass: "Sedan", Transmission: "Automatic", Seats: 5, Mileage: "14,500 km", FuelType: "Electric", BatteryLevel: "84%", Owner: "Anna", Status: "AVAILABLE", PricePerKm: 8, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 0, BaseLatMicro: 46252100, BaseLonMicro: 20141000},
+		{ID: "SCOOTER_001", Type: "Scooter", Make: "Xiaomi", Model: "M365", CarClass: "Micro", Transmission: "N/A", Seats: 1, Mileage: "850 km", FuelType: "Electric", BatteryLevel: "100%", Owner: "Brian", Status: "AVAILABLE", PricePerKm: 3, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 0, BaseLatMicro: 46253000, BaseLonMicro: 20141400},
 	}
 
 	for _, asset := range assets {
@@ -244,8 +244,9 @@ func (s *SmartContract) RentAsset(ctx contractapi.TransactionContextInterface, i
 	return nil
 }
 
-// 🛑 RETURN ASSET (NOW RETURNS THE CRYPTOGRAPHIC TRIP ID)
-func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface, id string, returningUserId string, returnLatStr string, returnLonStr string) (string, error) {
+// 🛑 RETURN ASSET — Distance-Based Billing (Oracle Pattern)
+// The Go Server simulates distance and passes it deterministically.
+func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface, id string, returningUserId string, returnLatStr string, returnLonStr string, distanceStr string) (string, error) {
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + id)
 	if err != nil { return "", fmt.Errorf("failed to read from world state: %v", err) }
 	if assetJSON == nil { return "", fmt.Errorf("the asset %s does not exist", id) }
@@ -271,14 +272,19 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 		return "", fmt.Errorf("GEOFENCE ERROR: Vehicle abandoned outside the 150m home radius. Transaction Aborted")
 	}
 
+	// Parse the Oracle-injected simulated distance
+	distanceKm, _ := strconv.ParseInt(distanceStr, 10, 64)
+	if distanceKm < 1 { distanceKm = 1 }
+
 	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
 	endTime := txTimestamp.Seconds
 	durationSeconds := endTime - asset.StartTime
 	durationMins := durationSeconds / 60
 	if durationMins < 1 { durationMins = 1 } 
 
-	totalCost := durationMins * asset.PricePerMinute
-	co2Saved := durationMins * asset.CO2SavingsRate
+	// 🛣️ DISTANCE-BASED BILLING: Cost = (distance * pricePerKm) + baseFee
+	baseFee := int64(1)
+	totalCost := (distanceKm * asset.PricePerKm) + baseFee
 
 	renterJSON, _ := ctx.GetStub().GetState("USER_" + returningUserId)
 	var renter UserProfile
@@ -306,7 +312,7 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 		EndTime:        endTime,
 		DurationMins:   durationMins,
 		TotalCost:      totalCost,
-		CO2Saved:       co2Saved,
+		CO2Saved:       0, // Calculated off-chain by Go Server
 		PenaltyApplied: "None",
 		OwnerRated:     false,
 		RenterRated:    false,
