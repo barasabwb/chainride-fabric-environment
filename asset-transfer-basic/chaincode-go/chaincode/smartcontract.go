@@ -31,7 +31,7 @@ type UserProfile struct {
 	TokenBalance  int64   `json:"TokenBalance"`
 	LoyaltyPoints int64   `json:"LoyaltyPoints"`
 	TrustScore    float64 `json:"TrustScore"` 
-	RatingCount   int     `json:"RatingCount"` // 🚨 NEW: For mathematically sound weighted averages
+	RatingCount   int     `json:"RatingCount"`
 }
 
 type Asset struct {
@@ -51,8 +51,8 @@ type Asset struct {
 	StartTime      int64  `json:"StartTime"`
 	CurrentRenter  string `json:"CurrentRenter"`
 	CO2SavingsRate int64  `json:"CO2SavingsRate"`
-	BaseLatMicro   int64  `json:"BaseLatMicro"` // 🚨 DETERMINISTIC: Stored in Microdegrees
-	BaseLonMicro   int64  `json:"BaseLonMicro"` // 🚨 DETERMINISTIC: Stored in Microdegrees
+	BaseLatMicro   int64  `json:"BaseLatMicro"`
+	BaseLonMicro   int64  `json:"BaseLonMicro"`
 }
 
 type Trip struct {
@@ -66,11 +66,10 @@ type Trip struct {
 	TotalCost      int64  `json:"TotalCost"`
 	CO2Saved       int64  `json:"CO2Saved"`
 	PenaltyApplied string `json:"PenaltyApplied"`
-	OwnerRated     bool   `json:"OwnerRated"`  // 🚨 NEW: Prevents double-rating spam
-	RenterRated    bool   `json:"RenterRated"` // 🚨 NEW: Prevents double-rating spam
+	OwnerRated     bool   `json:"OwnerRated"`
+	RenterRated    bool   `json:"RenterRated"`
 }
 
-// 🚨 NEW: Immutable, auditable rating record
 type Rating struct {
 	RatingID   string  `json:"RatingID"`
 	TripID     string  `json:"TripID"`
@@ -99,8 +98,8 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 	}
 
 	assets := []Asset{
-		{ID: "CAR_001", Type: "Car", Make: "Tesla", Model: "Model 3", CarClass: "Sedan", Transmission: "Automatic", Seats: 5, Mileage: "14,500 km", FuelType: "Electric", BatteryLevel: "84%", Owner: "Anna", Status: "AVAILABLE", PricePerKm: 8, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 0, BaseLatMicro: 46252100, BaseLonMicro: 20141000},
-		{ID: "SCOOTER_001", Type: "Scooter", Make: "Xiaomi", Model: "M365", CarClass: "Micro", Transmission: "N/A", Seats: 1, Mileage: "850 km", FuelType: "Electric", BatteryLevel: "100%", Owner: "Brian", Status: "AVAILABLE", PricePerKm: 3, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 0, BaseLatMicro: 46253000, BaseLonMicro: 20141400},
+		{ID: "CAR_001", Type: "Car", Make: "Tesla", Model: "Model 3", CarClass: "Sedan", Transmission: "Automatic", Seats: 5, Mileage: "14,500 km", FuelType: "Electric", BatteryLevel: "84%", Owner: "Anna", Status: "AVAILABLE", PricePerKm: 12, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 100, BaseLatMicro: 46252100, BaseLonMicro: 20141000},
+		{ID: "SCOOTER_001", Type: "Scooter", Make: "Xiaomi", Model: "M365", CarClass: "Micro", Transmission: "N/A", Seats: 1, Mileage: "850 km", FuelType: "Electric", BatteryLevel: "100%", Owner: "Brian", Status: "AVAILABLE", PricePerKm: 4, StartTime: 0, CurrentRenter: "", CO2SavingsRate: 130, BaseLatMicro: 46253000, BaseLonMicro: 20141400},
 	}
 
 	for _, asset := range assets {
@@ -181,6 +180,35 @@ func (s *SmartContract) ToggleAssetStatus(ctx contractapi.TransactionContextInte
 	return ctx.GetStub().PutState("ASSET_"+id, updatedAssetJSON)
 }
 
+// 🚨 NEW: Admin-level manual asset suspension
+func (s *SmartContract) AdminToggleAssetStatus(ctx contractapi.TransactionContextInterface, adminID string, assetID string) error {
+	userJSON, err := ctx.GetStub().GetState("USER_" + adminID)
+	if err != nil || userJSON == nil { return fmt.Errorf("admin user %s does not exist", adminID) }
+	
+	var admin UserProfile
+	json.Unmarshal(userJSON, &admin)
+	if admin.Role != RoleAdmin { return fmt.Errorf("SECURITY ALERT: User %s lacks ADMIN privileges", adminID) }
+
+	assetJSON, err := ctx.GetStub().GetState("ASSET_" + assetID)
+	if err != nil || assetJSON == nil { return fmt.Errorf("asset %s does not exist", assetID) }
+	
+	var asset Asset
+	json.Unmarshal(assetJSON, &asset)
+
+	if asset.Status == StatusBooked {
+		return fmt.Errorf("cannot suspend asset: asset %s is currently in use", assetID)
+	}
+
+	if asset.Status == StatusAvailable || asset.Status == StatusPending {
+		asset.Status = StatusUnavailable
+	} else if asset.Status == StatusUnavailable {
+		asset.Status = StatusAvailable
+	}
+
+	updatedAssetJSON, _ := json.Marshal(asset)
+	return ctx.GetStub().PutState("ASSET_"+assetID, updatedAssetJSON)
+}
+
 func (s *SmartContract) ApproveAsset(ctx contractapi.TransactionContextInterface, adminID string, assetID string) error {
 	userJSON, err := ctx.GetStub().GetState("USER_" + adminID)
 	if err != nil || userJSON == nil { return fmt.Errorf("admin user %s does not exist", adminID) }
@@ -246,7 +274,8 @@ func (s *SmartContract) RentAsset(ctx contractapi.TransactionContextInterface, i
 
 // 🛑 RETURN ASSET — Distance-Based Billing (Oracle Pattern)
 // The Go Server simulates distance and passes it deterministically.
-func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface, id string, returningUserId string, returnLatStr string, returnLonStr string, distanceStr string) (string, error) {
+// 🛑 RETURN ASSET — Thesis-Driven Tokenomics & Soft Geofence
+func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface, id string, returningUserId string, returnLatStr string, returnLonStr string, distanceStr string, platformFeeStr string, co2SavedStr string, parkedDistanceStr string) (string, error) {
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + id)
 	if err != nil { return "", fmt.Errorf("failed to read from world state: %v", err) }
 	if assetJSON == nil { return "", fmt.Errorf("the asset %s does not exist", id) }
@@ -259,32 +288,11 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 		return "", fmt.Errorf("user %s is not the current renter of this vehicle", returningUserId)
 	}
 
-	returnLatMicro, _ := strconv.ParseInt(returnLatStr, 10, 64)
-	returnLonMicro, _ := strconv.ParseInt(returnLonStr, 10, 64)
-
-	latDiff := returnLatMicro - asset.BaseLatMicro
-	if latDiff < 0 { latDiff = -latDiff }
-	lonDiff := returnLonMicro - asset.BaseLonMicro
-	if lonDiff < 0 { lonDiff = -lonDiff }
-
-	totalDiffMicro := latDiff + lonDiff
-	if totalDiffMicro > 1500 {
-		return "", fmt.Errorf("GEOFENCE ERROR: Vehicle abandoned outside the 150m home radius. Transaction Aborted")
-	}
-
-	// Parse the Oracle-injected simulated distance
+	// 🚨 TOKENOMICS ENGINE: Parse Oracle Data
 	distanceKm, _ := strconv.ParseInt(distanceStr, 10, 64)
 	if distanceKm < 1 { distanceKm = 1 }
-
-	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
-	endTime := txTimestamp.Seconds
-	durationSeconds := endTime - asset.StartTime
-	durationMins := durationSeconds / 60
-	if durationMins < 1 { durationMins = 1 } 
-
-	// 🛣️ DISTANCE-BASED BILLING: Cost = (distance * pricePerKm) + baseFee
-	baseFee := int64(1)
-	totalCost := (distanceKm * asset.PricePerKm) + baseFee
+	co2SavedGrams, _ := strconv.ParseInt(co2SavedStr, 10, 64)
+	parkedDistanceMeters, _ := strconv.ParseInt(parkedDistanceStr, 10, 64)
 
 	renterJSON, _ := ctx.GetStub().GetState("USER_" + returningUserId)
 	var renter UserProfile
@@ -294,12 +302,98 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 	var owner UserProfile
 	json.Unmarshal(ownerJSON, &owner)
 
-	if renter.TokenBalance < totalCost {
-		return "", fmt.Errorf("insufficient funds")
+	// ==========================================
+	// 🌟 LOYALTY POINTS CALCULATION
+	// ==========================================
+	var earnedLoyalty int64 = 2 // Base completion points
+
+	// 1. Eco-Bonus by Vehicle Type
+	if asset.Type == "Bike" { earnedLoyalty += 12 } else
+	if asset.Type == "Scooter" { earnedLoyalty += 10 } else
+	if asset.Type == "Car" {
+		if asset.FuelType == "Electric" { earnedLoyalty += 8 } else
+		if asset.FuelType == "Hybrid" { earnedLoyalty += 4 }
 	}
 
+	// 2. CO2 Bonus (1 point per 100g saved)
+	earnedLoyalty += (co2SavedGrams / 100)
+
+	// 3. Trust Bonus
+	if renter.TrustScore >= 4.5 { earnedLoyalty += 5 } else
+	if renter.TrustScore >= 3.5 { earnedLoyalty += 2 }
+
+	// ==========================================
+	// 🛑 PENALTY SYSTEM & TRUST SCORE
+	// ==========================================
+	penaltyApplied := "None"
+	var parkingFine int64 = 0
+
+	if asset.Owner != "appUser" { // Only enforce geofences for P2P vehicles
+		if parkedDistanceMeters <= 150 {
+			earnedLoyalty += 5
+			renter.TrustScore += 0.05 // Good parking reward
+		} else if parkedDistanceMeters <= 300 {
+			parkingFine = 5
+			penaltyApplied = "Minor Parking Violation (150m-300m)"
+			renter.TrustScore -= 0.1
+		} else if parkedDistanceMeters <= 1000 {
+			parkingFine = 15
+			penaltyApplied = "Moderate Parking Violation (300m-1km)"
+			renter.TrustScore -= 0.2
+		} else {
+			parkingFine = 40
+			penaltyApplied = "Severe Abandonment (>1km)"
+			renter.TrustScore -= 0.5
+		}
+	} else {
+		// CR Fleet vehicles are dockless; always reward good returns
+		earnedLoyalty += 5
+		renter.TrustScore += 0.05
+	}
+
+	// Bound Trust Score between 1.0 and 5.0
+	if renter.TrustScore > 5.0 { renter.TrustScore = 5.0 }
+	if renter.TrustScore < 1.0 { renter.TrustScore = 1.0 }
+
+	// Apply Loyalty Points
+	renter.LoyaltyPoints += earnedLoyalty
+
+	// ==========================================
+	// 🛣️ BILLING & PAYMENTS
+	// ==========================================
+	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
+	endTime := txTimestamp.Seconds
+	durationSeconds := endTime - asset.StartTime
+	durationMins := durationSeconds / 60
+	if durationMins < 1 { durationMins = 1 } 
+
+	baseFee := int64(1)
+	totalCost := (distanceKm * asset.PricePerKm) + baseFee + parkingFine // Fine added to bill
+
+	if renter.TokenBalance < totalCost {
+		return "", fmt.Errorf("insufficient funds to cover trip cost and penalties. Needed: %d CRT", totalCost)
+	}
+
+	platformFee, _ := strconv.ParseInt(platformFeeStr, 10, 64)
+	if platformFee < 0 { platformFee = 0 }
+
+	// The fine goes to the Treasury, not the host
+	ownerPayout := (totalCost - parkingFine) - platformFee
+	if ownerPayout < 0 { ownerPayout = 0 }
+	totalPlatformRevenue := platformFee + parkingFine
+
 	renter.TokenBalance -= totalCost
-	owner.TokenBalance += totalCost
+	owner.TokenBalance += ownerPayout
+
+	// Send Platform Fees & Parking Fines to the Treasury
+	treasuryJSON, _ := ctx.GetStub().GetState("USER_PlatformTreasury")
+	if treasuryJSON != nil {
+		var treasury UserProfile
+		json.Unmarshal(treasuryJSON, &treasury)
+		treasury.TokenBalance += totalPlatformRevenue
+		updatedTreasury, _ := json.Marshal(treasury)
+		ctx.GetStub().PutState("USER_PlatformTreasury", updatedTreasury)
+	}
 
 	// 🚨 GENERATE THE BLOCKCHAIN HASH ID
 	tripID := "TRIP_" + ctx.GetStub().GetTxID() 
@@ -312,8 +406,8 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 		EndTime:        endTime,
 		DurationMins:   durationMins,
 		TotalCost:      totalCost,
-		CO2Saved:       0, // Calculated off-chain by Go Server
-		PenaltyApplied: "None",
+		CO2Saved:       co2SavedGrams, // 🚨 Now logs actual Oracle math
+		PenaltyApplied: penaltyApplied, // 🚨 Now logs exactly how bad the parking was
 		OwnerRated:     false,
 		RenterRated:    false,
 	}

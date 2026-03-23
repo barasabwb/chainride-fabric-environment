@@ -90,6 +90,7 @@ type GeoJSONProperties struct {
 	Icon           string `json:"icon"`
 	Owner          string `json:"owner"`
 	PricePerKm     int64  `json:"pricePerKm"`
+	Status         string `json:"status"`
 	Type           string `json:"type"`
 	CO2SavingsRate int64  `json:"co2Rate"`
 	Make           string `json:"make"`
@@ -200,6 +201,8 @@ func main() {
 
 	http.HandleFunc("/api/register", registerHandler)
 	http.HandleFunc("/api/create-asset", createAssetHandler)
+	http.HandleFunc("/api/update-asset", updateAssetHandler)
+	http.HandleFunc("/api/delete-asset", deleteAssetHandler)
 	http.HandleFunc("/api/admin/approve-asset", approveAssetHandler)
 	http.HandleFunc("/api/admin/reject-asset", rejectAssetHandler)
 	http.HandleFunc("/api/admin/pending-assets", getPendingAssetsHandler)
@@ -207,6 +210,10 @@ func main() {
 	http.HandleFunc("/api/admin/toggle-vehicle", toggleAdminVehicleHandler)
 	http.HandleFunc("/api/admin/fleet", getAdminFleetHandler)
 	http.HandleFunc("/api/admin/stats", getAdminStatsHandler)
+	http.HandleFunc("/api/admin/active-trips", getAdminActiveTripsHandler)
+	http.HandleFunc("/api/admin/force-end-trip", forceEndTripHandler)
+	http.HandleFunc("/api/admin/settings", adminSettingsHandler)
+	http.HandleFunc("/api/admin/add-fleet-vehicle", adminAddFleetVehicleHandler)
 	http.HandleFunc("/api/admin/pending-users", getAdminPendingUsersHandler)
 	http.HandleFunc("/api/admin/active-users", getAdminActiveUsersHandler)
 	http.HandleFunc("/api/admin/verify-user", verifyUserHandler)
@@ -215,6 +222,7 @@ func main() {
 	http.HandleFunc("/api/profile", getProfileHandler)
 	http.HandleFunc("/api/update-profile", updateProfileHandler)
 	http.HandleFunc("/api/upload-avatar", uploadAvatarHandler)
+	http.HandleFunc("/api/reupload-license", reuploadLicenseHandler)
 	http.HandleFunc("/api/my-vehicles", getMyVehiclesHandler)
 	http.HandleFunc("/api/host-stats", getHostStatsHandler)
 
@@ -226,6 +234,10 @@ func main() {
 
 	// Serve uploaded images statically
 	http.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
+
+
+    // icons
+	http.Handle("/icons/", http.StripPrefix("/icons/", http.FileServer(http.Dir("icons"))))
 
 	log.Println("Server listening on port 9000...")
 	if err := http.ListenAndServe("0.0.0.0:9000", nil); err != nil {
@@ -259,10 +271,12 @@ func initDB() {
 		email TEXT UNIQUE NOT NULL,
 		password_hash TEXT NOT NULL,
 		phone_number TEXT,
-		dob DATE,
+		dob TEXT,
 		license_number TEXT,
 		license_pic_path TEXT,
 		is_verified BOOLEAN DEFAULT 0,
+		admin_disabled BOOLEAN DEFAULT 0,
+		admin_reason TEXT,
 		reputation_score REAL DEFAULT 5.0,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 	);`
@@ -286,6 +300,8 @@ func initDB() {
 		co2_savings_rate INTEGER,
 		price_per_km REAL, -- 🚨 ADDED THIS
 		is_approved BOOLEAN DEFAULT 0,
+		admin_disabled BOOLEAN DEFAULT 0,
+		admin_reason TEXT,
 		avg_rating REAL DEFAULT 5.0,
 		image_path TEXT,
 		FOREIGN KEY(owner_id) REFERENCES users(id)
@@ -353,10 +369,23 @@ func initDB() {
 	);`
 	db.Exec(createEcoStats)
 
+	createSettings := `
+	CREATE TABLE IF NOT EXISTS global_settings (
+		key TEXT PRIMARY KEY,
+		value TEXT
+	);`
+	db.Exec(createSettings)
+
+	db.Exec("INSERT OR IGNORE INTO global_settings (key, value) VALUES ('platformFee', '5.0')")
+	db.Exec("INSERT OR IGNORE INTO global_settings (key, value) VALUES ('faucetLimit', '100')")
+	db.Exec("INSERT OR IGNORE INTO global_settings (key, value) VALUES ('ecoMultiplier', '1.5')")
+	db.Exec("INSERT OR IGNORE INTO global_settings (key, value) VALUES ('minTrustScore', '2.5')")
+
 	// ---------------- SEED DATA ----------------
 	seedUsers := `
 	INSERT OR IGNORE INTO users (id, name, email, password_hash, is_verified) VALUES 
 	('admin', 'Admin User', 'admin@chainride.com', 'adminpass', 1),
+	('appUser', 'ChainRide Fleet', 'fleet@chainride.com', 'adminpass', 1),
 	('Anna', 'Anna Smith', 'anna@example.com', 'userpass1', 1),
 	('Brian', 'Brian Jones', 'brian@example.com', 'userpass2', 1);
 	`
@@ -473,7 +502,8 @@ func enableCors(w *http.ResponseWriter) {
 
 func getGeoJSONFeed(w http.ResponseWriter, r *http.Request) {
     enableCors(&w)
-
+	effectiveUser := getEffectiveUser(r)
+	isAdmin := effectiveUser == "admin" || effectiveUser == "appUser"
     result, err := contract.EvaluateTransaction("GetAllAssets")
     if err != nil {
         http.Error(w, "Failed to read blockchain: "+err.Error(), 500)
@@ -486,31 +516,49 @@ func getGeoJSONFeed(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+    log.Printf("[GeoJSON Debug] Blockchain returned %d total assets\n", len(onChainAssets))
+
     features := []GeoJSONFeature{}
 
     for _, asset := range onChainAssets {
-        if asset.Status != "AVAILABLE" {
-            continue
-        }
+        log.Printf("[GeoJSON Debug] Asset %s | Status: %s | Owner: %s\n", asset.ID, asset.Status, asset.Owner)
+        
+		if asset.Status != "AVAILABLE" {
+			if !(isAdmin && asset.Status == "BOOKED") {
+				log.Printf("[GeoJSON Debug] SKIPPED %s (status=%s, not AVAILABLE)\n", asset.ID, asset.Status)
+				continue 
+			}else{
+				log.Printf("[GeoJSON Debug] CONTINUING %s (status=%s, Booked)\n", asset.ID, asset.Status)
+			}
+		}
 
         var lat, lon float64
         var vehicleImagePath, ownerImagePath sql.NullString // 🚨 Added ownerImagePath
         var avgRating float64
         var adminDisabled bool
 
-        // 🚨 UPDATED QUERY: Join with users table to get the host's profile picture and admin status
-        var isApproved bool
-        query := `
-            SELECT v.latitude, v.longitude, v.image_path, v.avg_rating, u.profile_pic_path, v.admin_disabled, v.is_approved 
-            FROM vehicles v
-            JOIN users u ON v.owner_id = u.id
-            WHERE v.id = ?
-        `
-        err := db.QueryRow(query, asset.ID).Scan(&lat, &lon, &vehicleImagePath, &avgRating, &ownerImagePath, &adminDisabled, &isApproved)
-        
-        if adminDisabled || !isApproved {
-            continue // 🚨 Admin has suspended or not approved this vehicle, block from map
-        }
+        // 🚨 UPDATED QUERY: Use LEFT JOIN so the vehicle doesn't vanish if the user is missing
+		var isApproved bool
+		query := `
+			SELECT v.latitude, v.longitude, v.image_path, v.avg_rating, u.profile_pic_path, v.admin_disabled, v.is_approved 
+			FROM vehicles v
+			LEFT JOIN users u ON v.owner_id = u.id
+			WHERE v.id = ?
+		`
+		err := db.QueryRow(query, asset.ID).Scan(&lat, &lon, &vehicleImagePath, &avgRating, &ownerImagePath, &adminDisabled, &isApproved)
+		
+		if err != nil {
+			// Fallback if metadata isn't in SQLite yet (e.g. freshly minted fleet vehicle)
+			log.Printf("[GeoJSON] Warning: SQLite missing for %s, using Blockchain fallback", asset.ID)
+			lat, lon = float64(asset.BaseLatMicro)/1000000.0, float64(asset.BaseLonMicro)/1000000.0
+			avgRating = 5.0
+			isApproved = true // Assume blockchain assets are approved if SQLite is lagging
+		}
+
+		if adminDisabled || !isApproved {
+			log.Printf("[GeoJSON Debug] SKIPPED %s (Not Approved or Admin Disabled)\n", asset.ID)
+			continue // Admin has suspended or not approved this vehicle, block from map
+		}
 
         if err != nil {
             // Fallback if metadata isn't in SQLite yet
@@ -529,18 +577,38 @@ func getGeoJSONFeed(w http.ResponseWriter, r *http.Request) {
             oImgUrl = fmt.Sprintf("%s/%s", BASE_URL, ownerImagePath.String)
         }
 
-        iconUrl := "https://img.icons8.com/color/48/000000/car-top-view.png"
-        if asset.Type == "Scooter" {
-            iconUrl = "https://img.icons8.com/color/48/000000/scooter.png"
-        } else if asset.Type == "Bike" {
-            iconUrl = "https://img.icons8.com/color/48/000000/bicycle.png"
+        // Dynamic icon based on vehicle type + car class
+        carIconName :=  "basecar.png"
+        switch asset.Type {
+        case "Scooter":
+            carIconName = "scooter.png"
+        case "Bike":
+            carIconName	 = "bike.png"
+        case "Motorcycle":
+            carIconName = "motorcycle.png"
+        case "Car":
+            switch asset.CarClass {
+            case "SUV":
+                carIconName = "suv.png"
+            case "Premium":
+                carIconName	 = "supercar.png"
+            case "Micro":
+                carIconName = "micro.png"
+            case "Van":
+                carIconName = "van.png"
+            case "Pickup":
+                carIconName = "pickup.png"
+            default:
+                carIconName = "basecar.png"
+            }
         }
-
+		iconUrl :=  fmt.Sprintf("%s/%s", BASE_URL, filepath.Join("icons", carIconName))
         features = append(features, GeoJSONFeature{
             Type: "Feature",
             Geometry: GeoJSONGeometry{Type: "Point", Coordinates: []float64{lon, lat}},
             Properties: GeoJSONProperties{
                 Name:           asset.ID,
+				Status:         asset.Status,
                 Icon:           iconUrl,
                 Owner:          asset.Owner,
                 PricePerKm:     asset.PricePerKm,
@@ -594,8 +662,8 @@ func createAssetHandler(w http.ResponseWriter, r *http.Request) {
 	price, _ := strconv.ParseInt(r.FormValue("price"), 10, 64)
 	co2Rate, _ := strconv.ParseInt(r.FormValue("co2Rate"), 10, 64)
 	seats, _ := strconv.Atoi(r.FormValue("seats"))
-	lat, _ := strconv.ParseFloat(r.FormValue("lat"), 64)
-	lon, _ := strconv.ParseFloat(r.FormValue("lon"), 64)
+	lat, _ := strconv.ParseFloat(r.FormValue("latitude"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("longitude"), 64)
 
 	payload := ChaincodeAsset{
 		ID:             r.FormValue("id"),
@@ -679,6 +747,22 @@ func rentAssetHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
+	// 🚨 DYNAMIC: Check Trust Score against Admin Settings before Blockchain
+	var minTrustScore float64 = 2.5
+	var trustStr string
+	db.QueryRow("SELECT value FROM global_settings WHERE key = 'minTrustScore'").Scan(&trustStr)
+	if parsed, err := strconv.ParseFloat(trustStr, 64); err == nil {
+		minTrustScore = parsed
+	}
+
+	var currentTrust float64 = 5.0
+	db.QueryRow("SELECT reputation_score FROM users WHERE id = ?", effectiveUser).Scan(&currentTrust)
+
+	if currentTrust < minTrustScore {
+		http.Error(w, fmt.Sprintf(`{"error": "NETWORK BAN: Trust Score of %.1f is below the %.1f minimum. Contact our support team."}`, currentTrust, minTrustScore), 403)
+		return
+	}
+
     // 3. Submit Transaction (Use = instead of := here)
     _, err = contract.SubmitTransaction("RentAsset", req.VehicleID, effectiveUser)
     if err != nil {
@@ -690,6 +774,20 @@ func rentAssetHandler(w http.ResponseWriter, r *http.Request) {
 
     w.Header().Set("Content-Type", "application/json")
     w.Write([]byte(`{"success": true, "message": "Vehicle unlocked"}`))
+}
+
+func calculateDistanceMeters(lat1, lon1, lat2, lon2 float64) float64 {
+	const R = 6371000 // Earth radius in meters
+	phi1 := lat1 * math.Pi / 180
+	phi2 := lat2 * math.Pi / 180
+	deltaPhi := (lat2 - lat1) * math.Pi / 180
+	deltaLambda := (lon2 - lon1) * math.Pi / 180
+
+	a := math.Sin(deltaPhi/2)*math.Sin(deltaPhi/2) +
+		math.Cos(phi1)*math.Cos(phi2)*math.Sin(deltaLambda/2)*math.Sin(deltaLambda/2)
+	c := 2 * math.Atan2(math.Sqrt(a), math.Sqrt(1-a))
+
+	return R * c
 }
 
 func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
@@ -714,14 +812,24 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	latMicroStr := strconv.FormatInt(toMicrodegrees(req.ReturnLat), 10)
-	lonMicroStr := strconv.FormatInt(toMicrodegrees(req.ReturnLon), 10)
-
 	var asset ChaincodeAsset
 	assetBytes, err := contract.EvaluateTransaction("ReadAsset", req.VehicleID)
 	if err == nil {
 		json.Unmarshal(assetBytes, &asset)
 	}
+
+	// 🚨 GEOFENCE BYPASS FOR FREE-FLOATING FLEET VEHICLES
+	if asset.Owner == "appUser" || req.ReturnLat == 0 {
+		req.ReturnLat = float64(asset.BaseLatMicro) / 1000000.0
+		req.ReturnLon = float64(asset.BaseLonMicro) / 1000000.0
+		
+		if asset.Owner == "appUser" && req.ReturnLat != 0 {
+			db.Exec("UPDATE vehicles SET latitude = ?, longitude = ? WHERE id = ?", req.ReturnLat, req.ReturnLon, req.VehicleID)
+		}
+	}
+
+	latMicroStr := strconv.FormatInt(toMicrodegrees(req.ReturnLat), 10)
+	lonMicroStr := strconv.FormatInt(toMicrodegrees(req.ReturnLon), 10)
 
 	// ==========================================
 	// 🛣️ ORACLE: Simulate Driven Distance
@@ -737,28 +845,13 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 	distanceKm = math.Round(distanceKm*100) / 100
 	distanceStr := strconv.FormatInt(int64(distanceKm), 10)
 
-	log.Printf("[ORACLE] Trip %s: %d mins, multiplier=%.2f, distance=%.1f km\n", req.VehicleID, durationMins, multiplier, distanceKm)
-
-	// Pass distance to Smart Contract as Oracle argument
-	result, err := contract.SubmitTransaction("ReturnAsset", req.VehicleID, effectiveUser, latMicroStr, lonMicroStr, distanceStr)
-	if err != nil {
-		w.WriteHeader(400)
-		w.Write([]byte(fmt.Sprintf(`{"success": false, "error": "%s"}`, err.Error())))
-		return
-	}
-
-	// 🚨 CATCH THE HASH ID FROM THE BLOCKCHAIN
-	blockchainTripID := string(result)
-
 	// ==========================================
-	// 🌍 OFF-CHAIN: Dynamic CO2 Calculation
+	// 🌍 ORACLE: Dynamic CO2 Calculation
 	// ==========================================
-	// Read the vehicle's actual emission from SQLite
 	var vehicleEmissionRate int64
 	var fuelType string
 	err = db.QueryRow("SELECT co2_savings_rate, fuel_type FROM vehicles WHERE id = ?", req.VehicleID).Scan(&vehicleEmissionRate, &fuelType)
 	if err != nil {
-		// Fallback: determine from fuel type on the blockchain asset
 		fuelType = asset.FuelType
 		switch fuelType {
 		case "Electric": vehicleEmissionRate = 0
@@ -769,39 +862,69 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Baseline: avg single-occupancy car = 192g CO2/km
-	baseline := int64(192)
-	passengers := int64(1)
-	co2Saved := int64(math.Max(0, float64((baseline*passengers - vehicleEmissionRate)) * distanceKm))
-
-	log.Printf("[ECO] Vehicle %s (%s): emission=%dg/km, distance=%.1fkm, co2_saved=%dg\n", req.VehicleID, fuelType, vehicleEmissionRate, distanceKm, co2Saved)
-
-	if asset.StartTime > 0 {
-		// Mirror the exact Smart Contract math to cache it in SQLite
-    totalCost := (distanceKm * float64(asset.PricePerKm)) + 1.0 // + 1.0 base unlock fee
-
-    insertTripQuery := `
-        INSERT INTO trips (id, driver_id, vehicle_id, start_time, end_time, distance_km, co2_saved, total_cost, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Completed')
-    `
-    db.Exec(insertTripQuery, blockchainTripID, effectiveUser, req.VehicleID, time.Unix(asset.StartTime, 0), time.Unix(endTime, 0), distanceKm, co2Saved, totalCost)
-	updateEcoQuery := `UPDATE eco_stats SET total_trips = total_trips + 1, total_co2_saved = total_co2_saved + ?, total_distance = total_distance + ? WHERE user_id = ?`
-	db.Exec(updateEcoQuery, co2Saved, distanceKm, effectiveUser)
-
-	// 🚗 Increment Mileage on the Vehicle Object
-	var currentMileageStr sql.NullString
-	err = db.QueryRow("SELECT mileage FROM vehicles WHERE id = ?", req.VehicleID).Scan(&currentMileageStr)
-	if err == nil && currentMileageStr.Valid {
-		cleanStr := strings.ReplaceAll(currentMileageStr.String, " km", "")
-		cleanStr = strings.ReplaceAll(cleanStr, ",", "")
-		currentMileage, parseErr := strconv.ParseFloat(cleanStr, 64)
-		if parseErr == nil {
-			newMileage := currentMileage + distanceKm
-			newMileageFormatted := fmt.Sprintf("%.1f", newMileage)
-			db.Exec("UPDATE vehicles SET mileage = ? WHERE id = ?", newMileageFormatted, req.VehicleID)
-		}
+	var ecoMultiplier float64 = 1.0
+	var ecoStr string
+	db.QueryRow("SELECT value FROM global_settings WHERE key = 'ecoMultiplier'").Scan(&ecoStr)
+	if parsed, err := strconv.ParseFloat(ecoStr, 64); err == nil {
+		ecoMultiplier = parsed
 	}
 
+	baseline := int64(192)
+	passengers := int64(1)
+	co2Saved := int64(math.Max(0, float64(baseline*passengers-vehicleEmissionRate)*distanceKm*ecoMultiplier))
+	co2SavedStr := strconv.FormatInt(co2Saved, 10)
+
+	// ==========================================
+	// 📍 ORACLE: Haversine Parked Distance
+	// ==========================================
+	baseLat := float64(asset.BaseLatMicro) / 1000000.0
+	baseLon := float64(asset.BaseLonMicro) / 1000000.0
+	parkedDistanceMeters := calculateDistanceMeters(baseLat, baseLon, req.ReturnLat, req.ReturnLon)
+	parkedDistanceStr := strconv.FormatInt(int64(math.Round(parkedDistanceMeters)), 10)
+
+	// ==========================================
+	// 💰 ORACLE: Platform Fee
+	// ==========================================
+	var platformFee float64 = 1.0
+	var feeStr2 string
+	db.QueryRow("SELECT value FROM global_settings WHERE key = 'platformFee'").Scan(&feeStr2)
+	if parsed, err := strconv.ParseFloat(feeStr2, 64); err == nil { platformFee = parsed }
+	platformFeeStr := strconv.FormatInt(int64(platformFee), 10)
+
+	// 🚨 SEND ALL ORACLE DATA TO THE BLOCKCHAIN ONCE
+	result, err := contract.SubmitTransaction("ReturnAsset", req.VehicleID, effectiveUser, latMicroStr, lonMicroStr, distanceStr, platformFeeStr, co2SavedStr, parkedDistanceStr)
+	if err != nil {
+		w.WriteHeader(400)
+		w.Write([]byte(fmt.Sprintf(`{"success": false, "error": "%s"}`, err.Error())))
+		return
+	}
+
+	blockchainTripID := string(result)
+
+	// Cache to SQLite
+	if asset.StartTime > 0 {
+		totalCost := (distanceKm * float64(asset.PricePerKm)) + 1.0 
+
+		insertTripQuery := `
+			INSERT INTO trips (id, driver_id, vehicle_id, start_time, end_time, distance_km, co2_saved, total_cost, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Completed')
+		`
+		db.Exec(insertTripQuery, blockchainTripID, effectiveUser, req.VehicleID, time.Unix(asset.StartTime, 0), time.Unix(endTime, 0), distanceKm, co2Saved, totalCost)
+		updateEcoQuery := `UPDATE eco_stats SET total_trips = total_trips + 1, total_co2_saved = total_co2_saved + ?, total_distance = total_distance + ? WHERE user_id = ?`
+		db.Exec(updateEcoQuery, co2Saved, distanceKm, effectiveUser)
+
+		var currentMileageStr sql.NullString
+		err = db.QueryRow("SELECT mileage FROM vehicles WHERE id = ?", req.VehicleID).Scan(&currentMileageStr)
+		if err == nil && currentMileageStr.Valid {
+			cleanStr := strings.ReplaceAll(currentMileageStr.String, " km", "")
+			cleanStr = strings.ReplaceAll(cleanStr, ",", "")
+			currentMileage, parseErr := strconv.ParseFloat(cleanStr, 64)
+			if parseErr == nil {
+				newMileage := currentMileage + distanceKm
+				newMileageFormatted := fmt.Sprintf("%.1f", newMileage)
+				db.Exec("UPDATE vehicles SET mileage = ? WHERE id = ?", newMileageFormatted, req.VehicleID)
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -950,8 +1073,16 @@ func topUpHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Amount > 5000 {
-		http.Error(w, `{"error": "Faucet limit exceeded. Maximum request is 5000 tokens."}`, 400)
+	// Fetch limit once
+	var faucetLimit int = 5000
+	var limitStr string
+	db.QueryRow("SELECT value FROM global_settings WHERE key = 'faucetLimit'").Scan(&limitStr)
+	if parsed, err := strconv.Atoi(limitStr); err == nil {
+		faucetLimit = parsed
+	}
+
+	if req.Amount > faucetLimit {
+		http.Error(w, fmt.Sprintf(`{"error": "Faucet limit exceeded. Maximum request is %d tokens."}`, faucetLimit), 400)
 		return
 	}
 
@@ -1271,6 +1402,8 @@ type ProfileResponse struct {
 	IsVerified     bool   `json:"isVerified"`
 	LicensePicPath string `json:"licensePicPath"`
 	ProfilePicPath string `json:"profilePicPath"`
+	AdminDisabled  bool   `json:"adminDisabled"`
+	AdminReason    string `json:"adminReason"`
 }
 
 func getProfileHandler(w http.ResponseWriter, r *http.Request) {
@@ -1378,6 +1511,122 @@ func uploadAvatarHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "profilePicPath": imagePath})
 }
 
+func reuploadLicenseHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+
+	effectiveUser := getEffectiveUser(r)
+	if effectiveUser == "" {
+		http.Error(w, `{"error": "Unauthorized"}`, 401)
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	file, handler, err := r.FormFile("licenseImage")
+	if err != nil {
+		http.Error(w, `{"error": "Failed to retrieve image"}`, 400)
+		return
+	}
+	defer file.Close()
+
+	os.MkdirAll("uploads", os.ModePerm)
+	filename := fmt.Sprintf("%s_%d%s", effectiveUser, time.Now().Unix(), filepath.Ext(handler.Filename))
+	imagePath := filepath.Join("uploads", filename)
+
+	dst, err := os.Create(imagePath)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to save file"}`, 500)
+		return
+	}
+	defer dst.Close()
+	io.Copy(dst, file)
+
+	// Update DB: Set the path, reset verified to 0, and clear the reason
+	_, err = db.Exec("UPDATE users SET license_pic_path = ?, is_verified = 0, admin_reason = NULL WHERE id = ?", imagePath, effectiveUser)
+	if err != nil {
+		http.Error(w, `{"error": "Failed to update profile"}`, 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "licensePicPath": imagePath})
+}
+
+
+func updateAssetHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+
+	effectiveUser := getEffectiveUser(r)
+	if effectiveUser == "" {
+		http.Error(w, `{"error": "Unauthorized"}`, 401)
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, http.StatusBadRequest)
+		return
+	}
+
+	assetID := r.FormValue("id")
+	if assetID == "" {
+		http.Error(w, `{"error": "Vehicle ID is required"}`, http.StatusBadRequest)
+		return
+	}
+
+	file, handler, err := r.FormFile("image")
+	var imagePath string
+	if err == nil {
+		defer file.Close()
+		os.MkdirAll("uploads", os.ModePerm)
+		filename := fmt.Sprintf("%s_%d%s", assetID, time.Now().Unix(), filepath.Ext(handler.Filename))
+		imagePath = filepath.Join("uploads", filename)
+		dst, _ := os.Create(imagePath)
+		defer dst.Close()
+		io.Copy(dst, file)
+	} else {
+		db.QueryRow("SELECT image_path FROM vehicles WHERE id = ? AND owner_id = ?", assetID, effectiveUser).Scan(&imagePath)
+	}
+
+	_, err = db.Exec("UPDATE vehicles SET make=?, model=?, vehicle_type=?, car_class=?, transmission=?, seats=?, mileage=?, battery_level=?, latitude=?, longitude=?, image_path=?, co2_savings_rate=?, price_per_km=?, is_approved=0, admin_reason=NULL WHERE id=? AND owner_id=?", 
+		r.FormValue("make"), r.FormValue("model"), r.FormValue("assetType"), r.FormValue("carClass"), r.FormValue("transmission"), 
+		r.FormValue("seats"), r.FormValue("mileage"), r.FormValue("batteryLevel"), r.FormValue("latitude"), r.FormValue("longitude"), 
+		imagePath, r.FormValue("co2Emission"), r.FormValue("price"), assetID, effectiveUser)
+
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "Failed to update asset in database: %v"}`, err), 500)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func deleteAssetHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+
+	effectiveUser := getEffectiveUser(r)
+	if effectiveUser == "" {
+		http.Error(w, `{"error": "Unauthorized"}`, 401)
+		return
+	}
+
+	var req struct { VehicleID string `json:"vehicleId"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Invalid payload"}`, 400)
+		return
+	}
+
+	db.Exec("DELETE FROM vehicles WHERE id = ? AND owner_id = ?", req.VehicleID, effectiveUser)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
 
 // ==========================================
 // 🚗 MY VEHICLES API (UPDATED)
@@ -1453,7 +1702,11 @@ func getMyVehiclesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if !isApproved {
-			chaincodeStatus = "Pending Approval"
+			if adminReason.Valid && adminReason.String != "" {
+				chaincodeStatus = "Rejected"
+			} else {
+				chaincodeStatus = "Pending Approval"
+			}
 		} else if adminDisabled {
 			chaincodeStatus = "Disabled by Admin"
 		}
@@ -1462,6 +1715,8 @@ func getMyVehiclesHandler(w http.ResponseWriter, r *http.Request) {
 			"id":           id.String,
 			"type":         vType.String,
 			"title":        vmake.String + " " + model.String,
+			"make":         vmake.String,
+			"model":        model.String,
 			"class":        vClass.String,
 			"location":     "Stored Location",
 			"price":        price,
@@ -1507,11 +1762,20 @@ func toggleAdminVehicleHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Update the vehicle's off-chain suspension parameters
-	_, err := db.Exec("UPDATE vehicles SET admin_disabled = ?, admin_reason = ? WHERE id = ?", req.Disabled, req.Reason, req.VehicleID)
+	// 🚨 NEW: Execute the Blockchain Kill-Switch
+	// This physically locks the smart contract so raw API attacks cannot rent it
+	_, err := contract.SubmitTransaction("AdminToggleAssetStatus", effectiveUser, req.VehicleID)
+	if err != nil {
+		log.Printf("[AdminSecurity] Blockchain suspension failed for %s: %v\n", req.VehicleID, err)
+		http.Error(w, `{"error": "Failed to suspend asset on the blockchain. Check if vehicle is currently BOOKED."}`, 500)
+		return
+	}
+
+	// Update the vehicle's off-chain SQLite suspension parameters
+	_, err = db.Exec("UPDATE vehicles SET admin_disabled = ?, admin_reason = ? WHERE id = ?", req.Disabled, req.Reason, req.VehicleID)
 	if err != nil {
 		log.Printf("DB Error suspending vehicle: %v", err)
-		http.Error(w, `{"error": "Failed to update asset suspension state"}`, 500)
+		http.Error(w, `{"error": "Failed to update asset suspension state in database"}`, 500)
 		return
 	}
 
@@ -1614,17 +1878,31 @@ func getAdminStatsHandler(w http.ResponseWriter, r *http.Request) {
 	db.QueryRow("SELECT SUM(co2_saved), SUM(total_cost) FROM trips").Scan(&co2Saved, &grossRevenue)
 
 	revenue := 0.0
-	if grossRevenue.Valid {
-		revenue = grossRevenue.Float64
-	}
-	
+	if grossRevenue.Valid { revenue = grossRevenue.Float64 }
 	co2 := 0.0
-	if co2Saved.Valid {
-		co2 = co2Saved.Float64
-	}
+	if co2Saved.Valid { co2 = co2Saved.Float64 }
 
-	// 1 CRT fee per trip
-	platformFees := float64(totalTrips) * 1.0
+	// Calculate dynamic Platform Fees from SQL global configurations
+	var platformFee float64 = 1.0
+	var feeStr string
+	err := db.QueryRow("SELECT value FROM global_settings WHERE key = 'platformFee'").Scan(&feeStr)
+	if err == nil {
+		if parsed, err := strconv.ParseFloat(feeStr, 64); err == nil {
+			platformFee = parsed
+		}
+	}
+	platformFees := float64(totalTrips) * platformFee
+
+	// 🚨 NEW: Fetch the ACTUAL Treasury Balance from the Blockchain!
+	treasuryBalance := 0.0
+	treasuryBytes, err := contract.EvaluateTransaction("GetUser", "PlatformTreasury")
+	if err == nil && treasuryBytes != nil {
+		var treasury struct {
+			TokenBalance float64 `json:"TokenBalance"`
+		}
+		json.Unmarshal(treasuryBytes, &treasury)
+		treasuryBalance = treasury.TokenBalance
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
@@ -1634,6 +1912,7 @@ func getAdminStatsHandler(w http.ResponseWriter, r *http.Request) {
 		"co2Saved": co2,
 		"grossRevenue": revenue,
 		"platformFees": platformFees,
+		"treasuryBalance": treasuryBalance, // 🚨 Send it to React
 	})
 }
 
@@ -1649,7 +1928,7 @@ func getAdminPendingUsersHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := db.Query(`SELECT id, name, email, dob, license_number, license_pic_path FROM users WHERE is_verified = 0 AND license_pic_path IS NOT NULL`)
+	rows, err := db.Query(`SELECT id, name, email, CAST(dob AS TEXT) as dob, license_number, license_pic_path FROM users WHERE is_verified = 0 AND license_pic_path IS NOT NULL`)
 	if err != nil {
 		http.Error(w, `{"error": "Failed to query pending users"}`, 500)
 		return
@@ -1735,9 +2014,9 @@ func verifyUserHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Approved {
-		db.Exec("UPDATE users SET is_verified = 1 WHERE id = ?", req.UserID)
+		db.Exec("UPDATE users SET is_verified = 1, admin_reason = NULL WHERE id = ?", req.UserID)
 	} else {
-		db.Exec("UPDATE users SET is_verified = 0, license_pic_path = NULL WHERE id = ?", req.UserID)
+		db.Exec("UPDATE users SET is_verified = 0, license_pic_path = NULL, admin_reason = ? WHERE id = ?", req.Reason, req.UserID)
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
@@ -1857,7 +2136,13 @@ func approveAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db.Exec("UPDATE vehicles SET is_approved = 1 WHERE id = ?", req.VehicleID)
+	// 🚨 CRITICAL: Transition from PENDING -> AVAILABLE on the blockchain
+	_, approveErr := contract.SubmitTransaction("ApproveAsset", "appUser", req.VehicleID)
+	if approveErr != nil {
+		log.Printf("[ApproveAsset] Warning: Blockchain approve failed for %s: %v\n", req.VehicleID, approveErr)
+	}
+
+	db.Exec("UPDATE vehicles SET is_approved = 1, admin_reason = NULL WHERE id = ?", req.VehicleID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -1876,7 +2161,7 @@ func rejectAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	db.Exec("DELETE FROM vehicles WHERE id = ?", req.VehicleID)
+	db.Exec("UPDATE vehicles SET is_approved = 0, admin_reason = ? WHERE id = ?", req.Reason, req.VehicleID)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
@@ -1907,4 +2192,188 @@ func getVehicleReviewsHandler(w http.ResponseWriter, r *http.Request) {
 	if reviews == nil { reviews = []map[string]interface{}{} }
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(reviews)
+}
+
+// ==========================================
+// 🚨 TASKS 5 & 6: TRIPS & SETTINGS OVERRIDES
+// ==========================================
+
+func getAdminActiveTripsHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+	if getEffectiveUser(r) != "admin" && getEffectiveUser(r) != "appUser" { http.Error(w, "Forbidden", 403); return }
+
+	rows, err := db.Query(`
+		SELECT t.id, u.name, v.make, v.model, v.vehicle_type, t.start_time, t.status, t.total_cost 
+		FROM trips t
+		JOIN users u ON t.driver_id = u.id
+		JOIN vehicles v ON t.vehicle_id = v.id
+		WHERE t.status != 'Completed' AND t.status != 'Finished'
+		ORDER BY t.start_time DESC
+	`)
+	if err != nil { http.Error(w, `{"error":"Query failed"}`, 500); return }
+	defer rows.Close()
+
+	var active []map[string]interface{}
+	for rows.Next() {
+		var id, uname, vmake, vmodel, vtype, status sql.NullString
+		var startTime []byte
+		var totalCost sql.NullFloat64
+
+		if err := rows.Scan(&id, &uname, &vmake, &vmodel, &vtype, &startTime, &status, &totalCost); err != nil { continue }
+		
+		active = append(active, map[string]interface{}{
+			"id": id.String,
+			"user": uname.String,
+			"vehicle": vmake.String + " " + vmodel.String,
+			"type": vtype.String,
+			"startTime": string(startTime),
+			"status": status.String,
+			"cost": fmt.Sprintf("$%.2f", totalCost.Float64),
+			"note": "Admin oversight active",
+		})
+	}
+	if active == nil { active = []map[string]interface{}{} }
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(active)
+}
+
+func forceEndTripHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+	if getEffectiveUser(r) != "admin" && getEffectiveUser(r) != "appUser" { http.Error(w, "Forbidden", 403); return }
+
+	var req struct { RideID string `json:"rideId"` }
+	json.NewDecoder(r.Body).Decode(&req)
+
+	db.Exec("UPDATE trips SET status = 'Completed', end_time = CURRENT_TIMESTAMP WHERE id = ?", req.RideID)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+func adminSettingsHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+	if getEffectiveUser(r) != "admin" && getEffectiveUser(r) != "appUser" { http.Error(w, "Forbidden", 403); return }
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if r.Method == http.MethodGet {
+		rows, _ := db.Query("SELECT key, value FROM global_settings")
+		defer rows.Close()
+		config := make(map[string]string)
+		for rows.Next() {
+			var k, v string
+			rows.Scan(&k, &v)
+			config[k] = v
+		}
+		json.NewEncoder(w).Encode(config)
+		return
+	}
+
+	if r.Method == http.MethodPost {
+		var config map[string]string
+		json.NewDecoder(r.Body).Decode(&config)
+		for k, v := range config {
+			db.Exec("UPDATE global_settings SET value = ? WHERE key = ?", v, k)
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+		return
+	}
+}
+
+func disputeTripHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { return }
+	
+	effectiveUser := getEffectiveUser(r)
+	if effectiveUser == "" {
+		http.Error(w, `{"error": "Unauthorized"}`, 401)
+		return
+	}
+
+	var req struct { TripID string `json:"tripId"`; Note string `json:"note"` }
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "Invalid request"}`, 400)
+		return
+	}
+
+	db.Exec("UPDATE trips SET status = 'Disputed', note = ? WHERE id = ?", req.Note, req.TripID)
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"success": true})
+}
+
+func adminAddFleetVehicleHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" { w.WriteHeader(200); return }
+
+	effectiveUser := getEffectiveUser(r)
+	if effectiveUser != "admin" && effectiveUser != "appUser" {
+		http.Error(w, `{"error": "Forbidden"}`, 403)
+		return
+	}
+
+	if err := r.ParseMultipartForm(10 << 20); err != nil {
+		http.Error(w, `{"error": "Failed to parse form data"}`, 400)
+		return
+	}
+
+	price, _ := strconv.ParseInt(r.FormValue("price"), 10, 64)
+	co2Rate, _ := strconv.ParseInt(r.FormValue("co2Rate"), 10, 64)
+	seats, _ := strconv.Atoi(r.FormValue("seats"))
+	lat, _ := strconv.ParseFloat(r.FormValue("latitude"), 64)
+	lon, _ := strconv.ParseFloat(r.FormValue("longitude"), 64)
+
+	file, handler, imgErr := r.FormFile("vehicleImage")
+	var imagePath string
+	if imgErr == nil {
+		defer file.Close()
+		os.MkdirAll("uploads", os.ModePerm)
+		filename := fmt.Sprintf("%s_%d%s", r.FormValue("id"), time.Now().Unix(), filepath.Ext(handler.Filename))
+		imagePath = filepath.Join("uploads", filename)
+		dst, _ := os.Create(imagePath)
+		defer dst.Close()
+		io.Copy(dst, file)
+	}
+
+	payload := ChaincodeAsset{
+		ID:             r.FormValue("id"),
+		Type:           r.FormValue("assetType"),
+		Make:           r.FormValue("make"),
+		Model:          r.FormValue("model"),
+		CarClass:       r.FormValue("carClass"),
+		Transmission:   r.FormValue("transmission"),
+		Seats:          seats,
+		Mileage:        r.FormValue("mileage"),
+		FuelType:       r.FormValue("fuelType"),
+		BatteryLevel:   r.FormValue("batteryLevel"),
+		Owner:          "appUser",
+		PricePerKm:     price,
+		CO2SavingsRate: co2Rate,
+		BaseLatMicro:   toMicrodegrees(lat),
+		BaseLonMicro:   toMicrodegrees(lon),
+	}
+
+	db.Exec(`INSERT INTO vehicles (id, owner_id, make, model, vehicle_type, car_class, transmission, seats, mileage, fuel_type, battery_level, latitude, longitude, co2_savings_rate, price_per_km, is_approved, image_path)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+		payload.ID, "appUser", payload.Make, payload.Model, payload.Type, payload.CarClass, payload.Transmission, payload.Seats, payload.Mileage, payload.FuelType, payload.BatteryLevel, lat, lon, payload.CO2SavingsRate, float64(payload.PricePerKm), imagePath)
+
+	payloadBytes, _ := json.Marshal(payload)
+	_, mintErr := contract.SubmitTransaction("CreateAsset", string(payloadBytes))
+	if mintErr != nil {
+		log.Printf("[AdminFleet] Mint failed for %s: %v\n", payload.ID, mintErr)
+		http.Error(w, fmt.Sprintf(`{"error": "Blockchain mint failed: %v"}`, mintErr), 500)
+		return
+	}
+
+	_, approveErr := contract.SubmitTransaction("ApproveAsset", "appUser", payload.ID)
+	if approveErr != nil {
+		log.Printf("[AdminFleet] Approve failed for %s: %v\n", payload.ID, approveErr)
+	}
+
+	log.Printf("[AdminFleet] Fleet vehicle %s is now live\n", payload.ID)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": fmt.Sprintf("Fleet vehicle %s is now live!", payload.ID)})
 }
