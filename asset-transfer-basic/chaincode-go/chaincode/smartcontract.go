@@ -370,19 +370,30 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 	baseFee := int64(1)
 	totalCost := (distanceKm * asset.PricePerKm) + baseFee + parkingFine // Fine added to bill
 
-	if renter.TokenBalance < totalCost {
-		return "", fmt.Errorf("insufficient funds to cover trip cost and penalties. Needed: %d CRT", totalCost)
-	}
+	// if renter.TokenBalance < totalCost {
+	// 	return "", fmt.Errorf("insufficient funds to cover trip cost and penalties. Needed: %d CRT", totalCost)
+	// }
 
 	platformFee, _ := strconv.ParseInt(platformFeeStr, 10, 64)
 	if platformFee < 0 { platformFee = 0 }
 
-	// The fine goes to the Treasury, not the host
 	ownerPayout := (totalCost - parkingFine) - platformFee
 	if ownerPayout < 0 { ownerPayout = 0 }
 	totalPlatformRevenue := platformFee + parkingFine
 
-	renter.TokenBalance -= totalCost
+	// 🚨 ALLOW NEGATIVE BALANCE (DEBT)
+	renter.TokenBalance -= totalCost 
+	
+	// If they go into debt, slash their Trust Score
+	if renter.TokenBalance < 0 {
+		renter.TrustScore -= 0.1
+		if penaltyApplied == "None" {
+			penaltyApplied = "Debt Incurred"
+		} else {
+			penaltyApplied += " & Debt Incurred"
+		}
+	}
+
 	owner.TokenBalance += ownerPayout
 
 	// Send Platform Fees & Parking Fines to the Treasury
@@ -613,4 +624,135 @@ func (s *SmartContract) GetAssetHistory(ctx contractapi.TransactionContextInterf
 	}
 
 	return records, nil
+}
+
+// 🚨 ADMIN OVERRIDE: Force End an Active Trip
+func (s *SmartContract) AdminForceEndTrip(ctx contractapi.TransactionContextInterface, adminID string, assetID string) (string, error) {
+	// 1. Verify Admin Privileges
+	adminJSON, err := ctx.GetStub().GetState("USER_" + adminID)
+	if err != nil || adminJSON == nil { return "", fmt.Errorf("admin user not found") }
+	
+	var admin UserProfile
+	json.Unmarshal(adminJSON, &admin)
+	if admin.Role != RoleAdmin { return "", fmt.Errorf("SECURITY ALERT: User %s lacks ADMIN privileges", adminID) }
+
+	// 2. Get Asset
+	assetJSON, err := ctx.GetStub().GetState("ASSET_" + assetID)
+	if err != nil || assetJSON == nil { return "", fmt.Errorf("asset not found") }
+	
+	var asset Asset
+	json.Unmarshal(assetJSON, &asset)
+
+	if asset.Status != StatusBooked { return "", fmt.Errorf("asset is not currently booked") }
+	renterID := asset.CurrentRenter
+
+	// 3. Emergency Billing (Charge 1 CRT base fee, forgive distance)
+	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
+	endTime := txTimestamp.Seconds
+	durationMins := (endTime - asset.StartTime) / 60
+	if durationMins < 1 { durationMins = 1 }
+
+	var totalCost int64 = 1 
+
+	renterJSON, _ := ctx.GetStub().GetState("USER_" + renterID)
+	var renter UserProfile
+	json.Unmarshal(renterJSON, &renter)
+	renter.TokenBalance -= totalCost // Allow debt
+
+	ownerJSON, _ := ctx.GetStub().GetState("USER_" + asset.Owner)
+	var owner UserProfile
+	json.Unmarshal(ownerJSON, &owner)
+	owner.TokenBalance += totalCost
+
+	// 4. Record Emergency Trip Receipt
+	tripID := "TRIP_ADMIN_" + ctx.GetStub().GetTxID()
+	trip := Trip{
+		TripID:         tripID,
+		AssetID:        assetID,
+		Renter:         renterID,
+		Owner:          asset.Owner,
+		StartTime:      asset.StartTime,
+		EndTime:        endTime,
+		DurationMins:   durationMins,
+		TotalCost:      totalCost,
+		CO2Saved:       0,
+		PenaltyApplied: "Admin Emergency Termination",
+	}
+
+	// 5. Reset Asset to Available
+	asset.Status = StatusAvailable
+	asset.CurrentRenter = ""
+	asset.StartTime = 0
+
+	// 6. Save all states
+	updatedAsset, _ := json.Marshal(asset)
+	ctx.GetStub().PutState("ASSET_"+assetID, updatedAsset)
+
+	updatedRenter, _ := json.Marshal(renter)
+	ctx.GetStub().PutState("USER_"+renterID, updatedRenter)
+
+	updatedOwner, _ := json.Marshal(owner)
+	ctx.GetStub().PutState("USER_"+asset.Owner, updatedOwner)
+
+	tripBytes, _ := json.Marshal(trip)
+	ctx.GetStub().PutState(tripID, tripBytes)
+
+	return tripID, nil
+}
+
+// 🚨 ADMIN OVERRIDE: Process a Dispute Refund (Platform Guarantee)
+func (s *SmartContract) AdminRefundTrip(ctx contractapi.TransactionContextInterface, adminID string, tripID string) error {
+	// 1. Verify Admin Privileges
+	adminJSON, err := ctx.GetStub().GetState("USER_" + adminID)
+	if err != nil || adminJSON == nil { return fmt.Errorf("admin user not found") }
+	
+	var admin UserProfile
+	json.Unmarshal(adminJSON, &admin)
+	if admin.Role != RoleAdmin { 
+		return fmt.Errorf("SECURITY ALERT: User lacks ADMIN privileges") 
+	}
+
+	// 2. Fetch the Disputed Trip
+	tripJSON, err := ctx.GetStub().GetState(tripID)
+	if err != nil || tripJSON == nil { return fmt.Errorf("trip %s not found on ledger", tripID) }
+	
+	var trip Trip
+	json.Unmarshal(tripJSON, &trip)
+
+	// Prevent Double-Refunding
+	if len(trip.PenaltyApplied) > 10 && trip.PenaltyApplied[:10] == "[REFUNDED]" {
+		return fmt.Errorf("this trip has already been refunded")
+	}
+
+	// 3. Fetch the Renter and the Platform Treasury
+	renterJSON, _ := ctx.GetStub().GetState("USER_" + trip.Renter)
+	var renter UserProfile
+	json.Unmarshal(renterJSON, &renter)
+
+	treasuryJSON, _ := ctx.GetStub().GetState("USER_PlatformTreasury")
+	var treasury UserProfile
+	if treasuryJSON != nil {
+		json.Unmarshal(treasuryJSON, &treasury)
+	}
+
+	// 4. Execute the Token Transfer (Treasury pays the Renter)
+	renter.TokenBalance += trip.TotalCost
+	treasury.TokenBalance -= trip.TotalCost
+
+	// 5. Mark the Receipt as Refunded
+	trip.PenaltyApplied = "[REFUNDED] " + trip.PenaltyApplied
+
+	// 6. Save all updated states back to the Ledger
+	updatedRenter, _ := json.Marshal(renter)
+	ctx.GetStub().PutState("USER_"+trip.Renter, updatedRenter)
+
+	if treasuryJSON != nil {
+		updatedTreasury, _ := json.Marshal(treasury)
+		ctx.GetStub().PutState("USER_PlatformTreasury", updatedTreasury)
+	}
+
+	updatedTrip, _ := json.Marshal(trip)
+	ctx.GetStub().PutState(tripID, updatedTrip)
+
+	return nil
 }
