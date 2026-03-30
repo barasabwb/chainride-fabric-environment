@@ -49,3 +49,5 @@ offchain_metadata.db
 organizations/
 channel-artifacts/
 system-genesis-block/
+
+uploads/

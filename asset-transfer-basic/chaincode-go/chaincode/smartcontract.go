@@ -8,13 +8,14 @@ import (
 	"github.com/hyperledger/fabric-contract-api-go/v2/contractapi"
 )
 
+// SmartContract exposes the ledger operations used by the ChainRide API.
 type SmartContract struct {
 	contractapi.Contract
 }
 
-// ==========================================
-// 1. CONSTANTS & DATA STRUCTURES
-// ==========================================
+// -----------------------------------------------------------------------------
+// 1. Constants and core data types
+// -----------------------------------------------------------------------------
 
 const (
 	StatusAvailable   = "AVAILABLE"
@@ -25,15 +26,17 @@ const (
 	RoleAdmin         = "ADMIN"
 )
 
+// UserProfile stores the on-ledger account state for a rider, host, or admin.
 type UserProfile struct {
 	UserID        string  `json:"UserID"`
 	Role          string  `json:"Role"`
 	TokenBalance  int64   `json:"TokenBalance"`
 	LoyaltyPoints int64   `json:"LoyaltyPoints"`
-	TrustScore    float64 `json:"TrustScore"` 
+	TrustScore    float64 `json:"TrustScore"`
 	RatingCount   int     `json:"RatingCount"`
 }
 
+// Asset represents a vehicle listing that can be booked through ChainRide.
 type Asset struct {
 	ID             string `json:"ID"`
 	Type           string `json:"Type"`
@@ -55,6 +58,7 @@ type Asset struct {
 	BaseLonMicro   int64  `json:"BaseLonMicro"`
 }
 
+// Trip captures the final rental summary written when a ride ends.
 type Trip struct {
 	TripID         string `json:"TripID"`
 	AssetID        string `json:"AssetID"`
@@ -70,6 +74,7 @@ type Trip struct {
 	RenterRated    bool   `json:"RenterRated"`
 }
 
+// Rating stores one side of the post-trip feedback exchange.
 type Rating struct {
 	RatingID   string  `json:"RatingID"`
 	TripID     string  `json:"TripID"`
@@ -79,12 +84,13 @@ type Rating struct {
 	Timestamp  int64   `json:"Timestamp"`
 }
 
-// ==========================================
-// 2. INITIALIZATION
-// ==========================================
+// -----------------------------------------------------------------------------
+// 2. Ledger initialization
+// -----------------------------------------------------------------------------
 
 func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) error {
-	// Give seeded users 1 rating so our weighted average math doesn't divide by zero!
+	// Seed the default users with a baseline rating count so weighted trust
+	// calculations work without special-case handling.
 	users := []UserProfile{
 		{UserID: "Anna", Role: RoleUser, TokenBalance: 0, LoyaltyPoints: 0, TrustScore: 5.0, RatingCount: 1},
 		{UserID: "Brian", Role: RoleUser, TokenBalance: 0, LoyaltyPoints: 0, TrustScore: 5.0, RatingCount: 1},
@@ -110,9 +116,9 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 	return nil
 }
 
-// ==========================================
-// 3. CORE FUNCTIONS & GOVERNANCE
-// ==========================================
+// -----------------------------------------------------------------------------
+// 3. Core account and asset operations
+// -----------------------------------------------------------------------------
 
 func (s *SmartContract) RegisterUser(ctx contractapi.TransactionContextInterface, userID string, initialBalanceStr string) error {
 	initialBalance, err := strconv.ParseInt(initialBalanceStr, 10, 64)
@@ -121,8 +127,12 @@ func (s *SmartContract) RegisterUser(ctx contractapi.TransactionContextInterface
 	}
 
 	existing, err := ctx.GetStub().GetState("USER_" + userID)
-	if err != nil { return err }
-	if existing != nil { return fmt.Errorf("user already exists") }
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return fmt.Errorf("An account with this user ID already exists")
+	}
 
 	user := UserProfile{
 		UserID:        userID,
@@ -130,27 +140,33 @@ func (s *SmartContract) RegisterUser(ctx contractapi.TransactionContextInterface
 		TokenBalance:  initialBalance,
 		LoyaltyPoints: 0,
 		TrustScore:    5.0,
-		RatingCount:   1, // Start with 1 rating of 5.0
+		RatingCount:   1, // Start with one baseline rating for trust score math.
 	}
 	userJSON, err := json.Marshal(user)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	return ctx.GetStub().PutState("USER_"+userID, userJSON)
 }
 
 func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface, assetJSONString string) error {
 	var newAsset Asset
 	if err := json.Unmarshal([]byte(assetJSONString), &newAsset); err != nil {
-		return fmt.Errorf("failed to parse asset JSON: %v", err)
+		return fmt.Errorf("We could not read the vehicle details: %v", err)
 	}
 
 	ownerJSON, err := ctx.GetStub().GetState("USER_" + newAsset.Owner)
 	if err != nil || ownerJSON == nil {
-		return fmt.Errorf("owner %s is not registered on the network", newAsset.Owner)
+		return fmt.Errorf("Owner %s does not have an active account", newAsset.Owner)
 	}
 
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + newAsset.ID)
-	if err != nil { return err }
-	if assetJSON != nil { return fmt.Errorf("the asset %s already exists", newAsset.ID) }
+	if err != nil {
+		return err
+	}
+	if assetJSON != nil {
+		return fmt.Errorf("Vehicle %s already exists", newAsset.ID)
+	}
 
 	newAsset.Status = StatusPending
 	newAsset.CurrentRenter = ""
@@ -162,13 +178,19 @@ func (s *SmartContract) CreateAsset(ctx contractapi.TransactionContextInterface,
 
 func (s *SmartContract) ToggleAssetStatus(ctx contractapi.TransactionContextInterface, id string, callerUserID string) error {
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + id)
-	if err != nil || assetJSON == nil { return fmt.Errorf("asset %s does not exist", id) }
+	if err != nil || assetJSON == nil {
+		return fmt.Errorf("Vehicle %s could not be found", id)
+	}
 
 	var asset Asset
 	json.Unmarshal(assetJSON, &asset)
 
-	if asset.Owner != callerUserID { return fmt.Errorf("SECURITY ALERT: User %s does not own asset %s", callerUserID, id) }
-	if asset.Status == StatusBooked { return fmt.Errorf("cannot toggle status: asset %s is currently in use", id) }
+	if asset.Owner != callerUserID {
+		return fmt.Errorf("You can only manage your own vehicles")
+	}
+	if asset.Status == StatusBooked {
+		return fmt.Errorf("Vehicle %s is currently in use and cannot be updated", id)
+	}
 
 	if asset.Status == StatusAvailable {
 		asset.Status = StatusUnavailable
@@ -180,23 +202,30 @@ func (s *SmartContract) ToggleAssetStatus(ctx contractapi.TransactionContextInte
 	return ctx.GetStub().PutState("ASSET_"+id, updatedAssetJSON)
 }
 
-// 🚨 NEW: Admin-level manual asset suspension
+// AdminToggleAssetStatus lets an administrator pause or restore a listing
+// without deleting the underlying asset record.
 func (s *SmartContract) AdminToggleAssetStatus(ctx contractapi.TransactionContextInterface, adminID string, assetID string) error {
 	userJSON, err := ctx.GetStub().GetState("USER_" + adminID)
-	if err != nil || userJSON == nil { return fmt.Errorf("admin user %s does not exist", adminID) }
-	
+	if err != nil || userJSON == nil {
+		return fmt.Errorf("The admin account could not be found")
+	}
+
 	var admin UserProfile
 	json.Unmarshal(userJSON, &admin)
-	if admin.Role != RoleAdmin { return fmt.Errorf("SECURITY ALERT: User %s lacks ADMIN privileges", adminID) }
+	if admin.Role != RoleAdmin {
+		return fmt.Errorf("This action requires an administrator account")
+	}
 
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + assetID)
-	if err != nil || assetJSON == nil { return fmt.Errorf("asset %s does not exist", assetID) }
-	
+	if err != nil || assetJSON == nil {
+		return fmt.Errorf("Vehicle %s could not be found", assetID)
+	}
+
 	var asset Asset
 	json.Unmarshal(assetJSON, &asset)
 
 	if asset.Status == StatusBooked {
-		return fmt.Errorf("cannot suspend asset: asset %s is currently in use", assetID)
+		return fmt.Errorf("Vehicle %s is currently in use and cannot be paused", assetID)
 	}
 
 	if asset.Status == StatusAvailable || asset.Status == StatusPending {
@@ -211,50 +240,68 @@ func (s *SmartContract) AdminToggleAssetStatus(ctx contractapi.TransactionContex
 
 func (s *SmartContract) ApproveAsset(ctx contractapi.TransactionContextInterface, adminID string, assetID string) error {
 	userJSON, err := ctx.GetStub().GetState("USER_" + adminID)
-	if err != nil || userJSON == nil { return fmt.Errorf("admin user %s does not exist", adminID) }
-	
+	if err != nil || userJSON == nil {
+		return fmt.Errorf("The admin account could not be found")
+	}
+
 	var admin UserProfile
 	json.Unmarshal(userJSON, &admin)
-	if admin.Role != RoleAdmin { return fmt.Errorf("SECURITY ALERT: User %s lacks ADMIN privileges", adminID) }
+	if admin.Role != RoleAdmin {
+		return fmt.Errorf("This action requires an administrator account")
+	}
 
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + assetID)
-	if err != nil || assetJSON == nil { return fmt.Errorf("asset %s does not exist", assetID) }
-	
+	if err != nil || assetJSON == nil {
+		return fmt.Errorf("Vehicle %s could not be found", assetID)
+	}
+
 	var asset Asset
 	json.Unmarshal(assetJSON, &asset)
 
-	if asset.Status != StatusPending { return fmt.Errorf("asset %s is currently %s and cannot be approved", assetID, asset.Status) }
+	if asset.Status != StatusPending {
+		return fmt.Errorf("Vehicle %s is currently %s and cannot be approved yet", assetID, asset.Status)
+	}
 
 	asset.Status = StatusAvailable
 	updatedAssetJSON, _ := json.Marshal(asset)
 	return ctx.GetStub().PutState("ASSET_"+assetID, updatedAssetJSON)
 }
 
-// =========================================================================================
-// 4. THE DECENTRALIZED BANK: RENTAL LOGIC & PAYMENTS
-// =========================================================================================
+// -----------------------------------------------------------------------------
+// 4. Rental settlement and balance updates
+// -----------------------------------------------------------------------------
 
 func (s *SmartContract) RentAsset(ctx contractapi.TransactionContextInterface, id string, newRenter string) error {
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + id)
-	if err != nil || assetJSON == nil { return fmt.Errorf("asset %s not found", id) }
+	if err != nil || assetJSON == nil {
+		return fmt.Errorf("Vehicle %s could not be found", id)
+	}
 
 	var asset Asset
 	json.Unmarshal(assetJSON, &asset)
 
-	if asset.Status != StatusAvailable { return fmt.Errorf("asset %s is not available", id) }
-	if asset.Owner == newRenter { return fmt.Errorf("owners cannot rent their own assets") }
+	if asset.Status != StatusAvailable {
+		return fmt.Errorf("Vehicle %s is not available right now", id)
+	}
+	if asset.Owner == newRenter {
+		return fmt.Errorf("You cannot book your own vehicle")
+	}
 
 	renterJSON, err := ctx.GetStub().GetState("USER_" + newRenter)
-	if err != nil || renterJSON == nil { return fmt.Errorf("renter %s does not exist", newRenter) }
+	if err != nil || renterJSON == nil {
+		return fmt.Errorf("Account %s could not be found", newRenter)
+	}
 
 	var renter UserProfile
 	json.Unmarshal(renterJSON, &renter)
-	
-	if renter.TokenBalance <= 0 { return fmt.Errorf("renter %s has insufficient funds", newRenter) }
-	
-	// 🚨 GOVERNANCE: Algorithmic Ban
-	if renter.TrustScore < 2.5 { 
-		return fmt.Errorf("NETWORK BAN: Trust Score of %.1f is below the 2.5 minimum required to rent", renter.TrustScore) 
+
+	if renter.TokenBalance <= 0 {
+		return fmt.Errorf("This account does not have enough balance to start a trip")
+	}
+
+	// Enforce the minimum trust score before a rental can start.
+	if renter.TrustScore < 2.5 {
+		return fmt.Errorf("This account's trust score of %.1f is below the minimum required to start a trip", renter.TrustScore)
 	}
 
 	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
@@ -264,7 +311,9 @@ func (s *SmartContract) RentAsset(ctx contractapi.TransactionContextInterface, i
 
 	updatedAssetJSON, _ := json.Marshal(asset)
 	err = ctx.GetStub().PutState("ASSET_"+id, updatedAssetJSON)
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 
 	eventPayload := fmt.Sprintf(`{"assetID":"%s", "renter":"%s"}`, id, newRenter)
 	ctx.GetStub().SetEvent("AssetRented", []byte(eventPayload))
@@ -272,25 +321,33 @@ func (s *SmartContract) RentAsset(ctx contractapi.TransactionContextInterface, i
 	return nil
 }
 
-// 🛑 RETURN ASSET — Distance-Based Billing (Oracle Pattern)
-// The Go Server simulates distance and passes it deterministically.
-// 🛑 RETURN ASSET — Thesis-Driven Tokenomics & Soft Geofence
+// ReturnAsset closes a trip using ride metrics calculated by the Go API.
+// The server supplies distance, fees, emissions saved, and parking distance so
+// the chaincode can settle the trip deterministically.
 func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface, id string, returningUserId string, returnLatStr string, returnLonStr string, distanceStr string, platformFeeStr string, co2SavedStr string, parkedDistanceStr string) (string, error) {
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + id)
-	if err != nil { return "", fmt.Errorf("failed to read from world state: %v", err) }
-	if assetJSON == nil { return "", fmt.Errorf("the asset %s does not exist", id) }
+	if err != nil {
+		return "", fmt.Errorf("We could not load this vehicle right now")
+	}
+	if assetJSON == nil {
+		return "", fmt.Errorf("Vehicle %s could not be found", id)
+	}
 
 	var asset Asset
 	err = json.Unmarshal(assetJSON, &asset)
-	if err != nil { return "", err }
-
-	if asset.CurrentRenter != returningUserId {
-		return "", fmt.Errorf("user %s is not the current renter of this vehicle", returningUserId)
+	if err != nil {
+		return "", err
 	}
 
-	// 🚨 TOKENOMICS ENGINE: Parse Oracle Data
+	if asset.CurrentRenter != returningUserId {
+		return "", fmt.Errorf("Only the active renter can end this trip")
+	}
+
+	// Parse the ride metrics supplied by the API layer.
 	distanceKm, _ := strconv.ParseInt(distanceStr, 10, 64)
-	if distanceKm < 1 { distanceKm = 1 }
+	if distanceKm < 1 {
+		distanceKm = 1
+	}
 	co2SavedGrams, _ := strconv.ParseInt(co2SavedStr, 10, 64)
 	parkedDistanceMeters, _ := strconv.ParseInt(parkedDistanceStr, 10, 64)
 
@@ -302,36 +359,41 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 	var owner UserProfile
 	json.Unmarshal(ownerJSON, &owner)
 
-	// ==========================================
-	// 🌟 LOYALTY POINTS CALCULATION
-	// ==========================================
+	// Loyalty rewards combine trip completion, eco impact, and trust bonuses.
 	var earnedLoyalty int64 = 2 // Base completion points
 
-	// 1. Eco-Bonus by Vehicle Type
-	if asset.Type == "Bike" { earnedLoyalty += 12 } else
-	if asset.Type == "Scooter" { earnedLoyalty += 10 } else
-	if asset.Type == "Car" {
-		if asset.FuelType == "Electric" { earnedLoyalty += 8 } else
-		if asset.FuelType == "Hybrid" { earnedLoyalty += 4 }
+	// Base reward by asset type.
+	if asset.Type == "Bike" {
+		earnedLoyalty += 12
+	} else if asset.Type == "Scooter" {
+		earnedLoyalty += 10
+	} else if asset.Type == "Car" {
+		if asset.FuelType == "Electric" {
+			earnedLoyalty += 8
+		} else if asset.FuelType == "Hybrid" {
+			earnedLoyalty += 4
+		}
 	}
 
-	// 2. CO2 Bonus (1 point per 100g saved)
+	// Add one point for every 100 grams of emissions avoided.
 	earnedLoyalty += (co2SavedGrams / 100)
 
-	// 3. Trust Bonus
-	if renter.TrustScore >= 4.5 { earnedLoyalty += 5 } else
-	if renter.TrustScore >= 3.5 { earnedLoyalty += 2 }
+	// Reward riders with consistently strong trust scores.
+	if renter.TrustScore >= 4.5 {
+		earnedLoyalty += 5
+	} else if renter.TrustScore >= 3.5 {
+		earnedLoyalty += 2
+	}
 
-	// ==========================================
-	// 🛑 PENALTY SYSTEM & TRUST SCORE
-	// ==========================================
+	// Apply parking rules and trust adjustments based on where the vehicle
+	// was returned.
 	penaltyApplied := "None"
 	var parkingFine int64 = 0
 
-	if asset.Owner != "appUser" { // Only enforce geofences for P2P vehicles
+	if asset.Owner != "appUser" { // Only peer-to-peer vehicles use the parking geofence.
 		if parkedDistanceMeters <= 150 {
 			earnedLoyalty += 5
-			renter.TrustScore += 0.05 // Good parking reward
+			renter.TrustScore += 0.05 // Reward careful returns close to the base location.
 		} else if parkedDistanceMeters <= 300 {
 			parkingFine = 5
 			penaltyApplied = "Minor Parking Violation (150m-300m)"
@@ -346,45 +408,51 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 			renter.TrustScore -= 0.5
 		}
 	} else {
-		// CR Fleet vehicles are dockless; always reward good returns
+		// Fleet vehicles do not use the peer-to-peer geofence rules.
 		earnedLoyalty += 5
 		renter.TrustScore += 0.05
 	}
 
-	// Bound Trust Score between 1.0 and 5.0
-	if renter.TrustScore > 5.0 { renter.TrustScore = 5.0 }
-	if renter.TrustScore < 1.0 { renter.TrustScore = 1.0 }
+	// Keep the trust score within the supported range.
+	if renter.TrustScore > 5.0 {
+		renter.TrustScore = 5.0
+	}
+	if renter.TrustScore < 1.0 {
+		renter.TrustScore = 1.0
+	}
 
-	// Apply Loyalty Points
+	// Store the loyalty points earned for this trip.
 	renter.LoyaltyPoints += earnedLoyalty
 
-	// ==========================================
-	// 🛣️ BILLING & PAYMENTS
-	// ==========================================
+	// Calculate the final charge and split the proceeds between the owner and
+	// the platform treasury.
 	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
 	endTime := txTimestamp.Seconds
 	durationSeconds := endTime - asset.StartTime
 	durationMins := durationSeconds / 60
-	if durationMins < 1 { durationMins = 1 } 
+	if durationMins < 1 {
+		durationMins = 1
+	}
 
 	baseFee := int64(1)
-	totalCost := (distanceKm * asset.PricePerKm) + baseFee + parkingFine // Fine added to bill
-
-	// if renter.TokenBalance < totalCost {
-	// 	return "", fmt.Errorf("insufficient funds to cover trip cost and penalties. Needed: %d CRT", totalCost)
-	// }
+	totalCost := (distanceKm * asset.PricePerKm) + baseFee + parkingFine // Include any parking fine in the final charge.
 
 	platformFee, _ := strconv.ParseInt(platformFeeStr, 10, 64)
-	if platformFee < 0 { platformFee = 0 }
+	if platformFee < 0 {
+		platformFee = 0
+	}
 
 	ownerPayout := (totalCost - parkingFine) - platformFee
-	if ownerPayout < 0 { ownerPayout = 0 }
+	if ownerPayout < 0 {
+		ownerPayout = 0
+	}
 	totalPlatformRevenue := platformFee + parkingFine
 
-	// 🚨 ALLOW NEGATIVE BALANCE (DEBT)
-	renter.TokenBalance -= totalCost 
-	
-	// If they go into debt, slash their Trust Score
+	// Allow negative balances so trips can still close even when the rider ends
+	// the trip in debt.
+	renter.TokenBalance -= totalCost
+
+	// Debt lowers trust and is reflected in the penalty summary.
 	if renter.TokenBalance < 0 {
 		renter.TrustScore -= 0.1
 		if penaltyApplied == "None" {
@@ -396,7 +464,7 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 
 	owner.TokenBalance += ownerPayout
 
-	// Send Platform Fees & Parking Fines to the Treasury
+	// Route platform fees and parking fines into the treasury account.
 	treasuryJSON, _ := ctx.GetStub().GetState("USER_PlatformTreasury")
 	if treasuryJSON != nil {
 		var treasury UserProfile
@@ -406,8 +474,8 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 		ctx.GetStub().PutState("USER_PlatformTreasury", updatedTreasury)
 	}
 
-	// 🚨 GENERATE THE BLOCKCHAIN HASH ID
-	tripID := "TRIP_" + ctx.GetStub().GetTxID() 
+	// Use the Fabric transaction ID as the canonical trip identifier.
+	tripID := "TRIP_" + ctx.GetStub().GetTxID()
 	trip := Trip{
 		TripID:         tripID,
 		AssetID:        id,
@@ -417,8 +485,8 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 		EndTime:        endTime,
 		DurationMins:   durationMins,
 		TotalCost:      totalCost,
-		CO2Saved:       co2SavedGrams, // 🚨 Now logs actual Oracle math
-		PenaltyApplied: penaltyApplied, // 🚨 Now logs exactly how bad the parking was
+		CO2Saved:       co2SavedGrams,  // Preserve the server-calculated emissions value.
+		PenaltyApplied: penaltyApplied, // Preserve the exact penalty description applied.
 		OwnerRated:     false,
 		RenterRated:    false,
 	}
@@ -439,48 +507,63 @@ func (s *SmartContract) ReturnAsset(ctx contractapi.TransactionContextInterface,
 	tripJSON, _ := json.Marshal(trip)
 	ctx.GetStub().PutState(tripID, tripJSON)
 
-	// 🚨 RETURN THE ID TO THE GO SERVER
+	// Return the trip ID so the API can mirror it into SQLite.
 	return tripID, nil
 }
 
-// ==========================================
-// 5. REPUTATION, BANKING & READ QUERIES
-// ==========================================
+// -----------------------------------------------------------------------------
+// 5. Reputation, balances, and read queries
+// -----------------------------------------------------------------------------
 
-// 🛡️ UPGRADED: Secure, Trip-Based Weighted Reputation System
+// RateTrip records one rating per participant side and updates the
+// target user's weighted trust score.
 func (s *SmartContract) RateTrip(ctx contractapi.TransactionContextInterface, tripID string, callerUserID string, stars float64) error {
-	if stars < 1.0 { stars = 1.0 } else if stars > 5.0 { stars = 5.0 }
+	if stars < 1.0 {
+		stars = 1.0
+	} else if stars > 5.0 {
+		stars = 5.0
+	}
 
 	tripJSON, err := ctx.GetStub().GetState(tripID)
-	if err != nil || tripJSON == nil { 
-		return fmt.Errorf("trip %s not found on the ledger", tripID) 
+	if err != nil || tripJSON == nil {
+		return fmt.Errorf("Trip %s could not be found", tripID)
 	}
 
 	var trip Trip
-	if err := json.Unmarshal(tripJSON, &trip); err != nil { return err }
+	if err := json.Unmarshal(tripJSON, &trip); err != nil {
+		return err
+	}
 
 	var targetUserID string
 	isOwnerRatingRenter := callerUserID == trip.Owner
 
 	if isOwnerRatingRenter {
-		if trip.OwnerRated { return fmt.Errorf("owner has already rated this trip") }
+		if trip.OwnerRated {
+			return fmt.Errorf("You have already rated this trip")
+		}
 		targetUserID = trip.Renter
 		trip.OwnerRated = true
 	} else if callerUserID == trip.Renter {
-		if trip.RenterRated { return fmt.Errorf("renter has already rated this trip") }
+		if trip.RenterRated {
+			return fmt.Errorf("You have already rated this trip")
+		}
 		targetUserID = trip.Owner
 		trip.RenterRated = true
 	} else {
-		return fmt.Errorf("SECURITY ALERT: User %s was not a participant in trip %s", callerUserID, tripID)
+		return fmt.Errorf("Only people on this trip can leave a rating")
 	}
 
 	userJSON, err := ctx.GetStub().GetState("USER_" + targetUserID)
-	if err != nil || userJSON == nil { return fmt.Errorf("target user %s not found", targetUserID) }
+	if err != nil || userJSON == nil {
+		return fmt.Errorf("The other user on this trip could not be found")
+	}
 
 	var user UserProfile
-	if err := json.Unmarshal(userJSON, &user); err != nil { return err }
+	if err := json.Unmarshal(userJSON, &user); err != nil {
+		return err
+	}
 
-	// 🧮 WEIGHTED AVERAGE MATH
+	// Update the trust score using the existing weighted average.
 	totalScore := user.TrustScore * float64(user.RatingCount)
 	totalScore += stars
 	user.RatingCount++
@@ -512,12 +595,12 @@ func (s *SmartContract) RateTrip(ctx contractapi.TransactionContextInterface, tr
 func (s *SmartContract) TopUpWallet(ctx contractapi.TransactionContextInterface, userID string, amountStr string) error {
 	amount, err := strconv.ParseInt(amountStr, 10, 64)
 	if err != nil || amount <= 0 {
-		return fmt.Errorf("invalid amount")
+		return fmt.Errorf("Please enter a valid amount")
 	}
 
 	userJSON, err := ctx.GetStub().GetState("USER_" + userID)
 	if err != nil || userJSON == nil {
-		return fmt.Errorf("user %s does not exist", userID)
+		return fmt.Errorf("Account %s could not be found", userID)
 	}
 
 	var user UserProfile
@@ -533,7 +616,7 @@ func (s *SmartContract) TopUpWallet(ctx contractapi.TransactionContextInterface,
 func (s *SmartContract) ReadAsset(ctx contractapi.TransactionContextInterface, id string) (*Asset, error) {
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + id)
 	if err != nil || assetJSON == nil {
-		return nil, fmt.Errorf("asset %s does not exist", id)
+		return nil, fmt.Errorf("Vehicle %s could not be found", id)
 	}
 	var asset Asset
 	if err := json.Unmarshal(assetJSON, &asset); err != nil {
@@ -567,10 +650,10 @@ func (s *SmartContract) GetAllAssets(ctx contractapi.TransactionContextInterface
 func (s *SmartContract) GetUser(ctx contractapi.TransactionContextInterface, userID string) (*UserProfile, error) {
 	userJSON, err := ctx.GetStub().GetState("USER_" + userID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read from world state: %v", err)
+		return nil, fmt.Errorf("We could not load this account right now")
 	}
 	if userJSON == nil {
-		return nil, fmt.Errorf("the user %s does not exist", userID)
+		return nil, fmt.Errorf("Account %s could not be found", userID)
 	}
 
 	var user UserProfile
@@ -626,45 +709,57 @@ func (s *SmartContract) GetAssetHistory(ctx contractapi.TransactionContextInterf
 	return records, nil
 }
 
-// 🚨 ADMIN OVERRIDE: Force End an Active Trip
+// AdminForceEndTrip closes an in-progress ride from the admin side and
+// records a minimal settlement so the asset can return to service.
 func (s *SmartContract) AdminForceEndTrip(ctx contractapi.TransactionContextInterface, adminID string, assetID string) (string, error) {
-	// 1. Verify Admin Privileges
+	// Verify that the caller has administrator privileges.
 	adminJSON, err := ctx.GetStub().GetState("USER_" + adminID)
-	if err != nil || adminJSON == nil { return "", fmt.Errorf("admin user not found") }
-	
+	if err != nil || adminJSON == nil {
+		return "", fmt.Errorf("The admin account could not be found")
+	}
+
 	var admin UserProfile
 	json.Unmarshal(adminJSON, &admin)
-	if admin.Role != RoleAdmin { return "", fmt.Errorf("SECURITY ALERT: User %s lacks ADMIN privileges", adminID) }
+	if admin.Role != RoleAdmin {
+		return "", fmt.Errorf("This action requires an administrator account")
+	}
 
-	// 2. Get Asset
+	// Load the currently booked asset.
 	assetJSON, err := ctx.GetStub().GetState("ASSET_" + assetID)
-	if err != nil || assetJSON == nil { return "", fmt.Errorf("asset not found") }
-	
+	if err != nil || assetJSON == nil {
+		return "", fmt.Errorf("Vehicle could not be found")
+	}
+
 	var asset Asset
 	json.Unmarshal(assetJSON, &asset)
 
-	if asset.Status != StatusBooked { return "", fmt.Errorf("asset is not currently booked") }
+	if asset.Status != StatusBooked {
+		return "", fmt.Errorf("This vehicle is not currently on an active trip")
+	}
 	renterID := asset.CurrentRenter
 
-	// 3. Emergency Billing (Charge 1 CRT base fee, forgive distance)
+	// Apply the emergency settlement. Only the base fee is charged, with no
+	// distance-based billing.
 	txTimestamp, _ := ctx.GetStub().GetTxTimestamp()
 	endTime := txTimestamp.Seconds
 	durationMins := (endTime - asset.StartTime) / 60
-	if durationMins < 1 { durationMins = 1 }
+	if durationMins < 1 {
+		durationMins = 1
+	}
 
-	var totalCost int64 = 1 
+	var totalCost int64 = 1
 
 	renterJSON, _ := ctx.GetStub().GetState("USER_" + renterID)
 	var renter UserProfile
 	json.Unmarshal(renterJSON, &renter)
-	renter.TokenBalance -= totalCost // Allow debt
+	renter.TokenBalance -= totalCost // Emergency closures can still push the renter balance negative.
 
 	ownerJSON, _ := ctx.GetStub().GetState("USER_" + asset.Owner)
 	var owner UserProfile
 	json.Unmarshal(ownerJSON, &owner)
 	owner.TokenBalance += totalCost
 
-	// 4. Record Emergency Trip Receipt
+	// Write an admin-generated trip record for auditability.
 	tripID := "TRIP_ADMIN_" + ctx.GetStub().GetTxID()
 	trip := Trip{
 		TripID:         tripID,
@@ -679,12 +774,12 @@ func (s *SmartContract) AdminForceEndTrip(ctx contractapi.TransactionContextInte
 		PenaltyApplied: "Admin Emergency Termination",
 	}
 
-	// 5. Reset Asset to Available
+	// Return the asset to the available state.
 	asset.Status = StatusAvailable
 	asset.CurrentRenter = ""
 	asset.StartTime = 0
 
-	// 6. Save all states
+	// Persist the asset, user balances, and trip record.
 	updatedAsset, _ := json.Marshal(asset)
 	ctx.GetStub().PutState("ASSET_"+assetID, updatedAsset)
 
@@ -700,31 +795,36 @@ func (s *SmartContract) AdminForceEndTrip(ctx contractapi.TransactionContextInte
 	return tripID, nil
 }
 
-// 🚨 ADMIN OVERRIDE: Process a Dispute Refund (Platform Guarantee)
+// AdminRefundTrip reimburses a disputed trip from the treasury and marks
+// the receipt so the same trip cannot be refunded twice.
 func (s *SmartContract) AdminRefundTrip(ctx contractapi.TransactionContextInterface, adminID string, tripID string) error {
-	// 1. Verify Admin Privileges
+	// Verify that the caller has administrator privileges.
 	adminJSON, err := ctx.GetStub().GetState("USER_" + adminID)
-	if err != nil || adminJSON == nil { return fmt.Errorf("admin user not found") }
-	
-	var admin UserProfile
-	json.Unmarshal(adminJSON, &admin)
-	if admin.Role != RoleAdmin { 
-		return fmt.Errorf("SECURITY ALERT: User lacks ADMIN privileges") 
+	if err != nil || adminJSON == nil {
+		return fmt.Errorf("The admin account could not be found")
 	}
 
-	// 2. Fetch the Disputed Trip
+	var admin UserProfile
+	json.Unmarshal(adminJSON, &admin)
+	if admin.Role != RoleAdmin {
+		return fmt.Errorf("This action requires an administrator account")
+	}
+
+	// Load the disputed trip record.
 	tripJSON, err := ctx.GetStub().GetState(tripID)
-	if err != nil || tripJSON == nil { return fmt.Errorf("trip %s not found on ledger", tripID) }
-	
+	if err != nil || tripJSON == nil {
+		return fmt.Errorf("Trip %s could not be found", tripID)
+	}
+
 	var trip Trip
 	json.Unmarshal(tripJSON, &trip)
 
-	// Prevent Double-Refunding
+	// Refuse repeated refunds for the same trip.
 	if len(trip.PenaltyApplied) > 10 && trip.PenaltyApplied[:10] == "[REFUNDED]" {
-		return fmt.Errorf("this trip has already been refunded")
+		return fmt.Errorf("This trip has already been refunded")
 	}
 
-	// 3. Fetch the Renter and the Platform Treasury
+	// Load the renter and treasury accounts.
 	renterJSON, _ := ctx.GetStub().GetState("USER_" + trip.Renter)
 	var renter UserProfile
 	json.Unmarshal(renterJSON, &renter)
@@ -735,14 +835,14 @@ func (s *SmartContract) AdminRefundTrip(ctx contractapi.TransactionContextInterf
 		json.Unmarshal(treasuryJSON, &treasury)
 	}
 
-	// 4. Execute the Token Transfer (Treasury pays the Renter)
+	// Move the refunded amount from the treasury back to the renter.
 	renter.TokenBalance += trip.TotalCost
 	treasury.TokenBalance -= trip.TotalCost
 
-	// 5. Mark the Receipt as Refunded
+	// Mark the trip so future reviews can see that it was refunded.
 	trip.PenaltyApplied = "[REFUNDED] " + trip.PenaltyApplied
 
-	// 6. Save all updated states back to the Ledger
+	// Persist the updated trip and account balances.
 	updatedRenter, _ := json.Marshal(renter)
 	ctx.GetStub().PutState("USER_"+trip.Renter, updatedRenter)
 
