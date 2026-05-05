@@ -21,12 +21,9 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// -----------------------------------------------------------------------------
-// 1. Data structures and configuration
-// -----------------------------------------------------------------------------
+// data structures and config helpers
 
-// toMicrodegrees converts GPS coordinates into integer microdegrees so the
-// values can be sent to chaincode without floating point drift.
+//microdegrees helper to avoid floating point issues
 func toMicrodegrees(coord float64) int64 {
 	return int64(coord * 1000000)
 }
@@ -64,7 +61,7 @@ func verifyJWT(r *http.Request) (*Claims, error) {
 }
 
 var jwtKey = getJWTSecret()
-var BASE_URL = os.Getenv("BASE_URL")
+var BASE_URL = os.Getenv("NGROK_BASE_URL")
 
 type Claims struct {
 	UserID string `json:"userId"`
@@ -72,7 +69,7 @@ type Claims struct {
 	jwt.RegisteredClaims
 }
 
-// GeoJSONFeatureCollection is the map payload returned to the frontend.
+// map payload structures
 type GeoJSONFeatureCollection struct {
 	Type     string           `json:"type"`
 	Features []GeoJSONFeature `json:"features"`
@@ -109,8 +106,7 @@ type GeoJSONProperties struct {
 	OwnerImage     string `json:"ownerImage"`
 }
 
-// ChaincodeAsset mirrors the asset shape returned by Fabric so the API can
-// enrich it with SQLite data before sending it to the client.
+
 type ChaincodeAsset struct {
 	ID             string `json:"ID"`
 	Type           string `json:"Type"`
@@ -159,9 +155,7 @@ type RateRequest struct {
 var contract *gateway.Contract
 var db *sql.DB
 
-// -----------------------------------------------------------------------------
-// 2. Server startup and database initialization
-// -----------------------------------------------------------------------------
+//Server entry point and db config
 func main() {
 	os.Setenv("DISCOVERY_AS_LOCALHOST", "true")
 	log.Println("Starting Server")
@@ -203,7 +197,7 @@ func main() {
 	http.HandleFunc("/api/map/cars.geojson", getGeoJSONFeed)
 	http.HandleFunc("/api/faucet", topUpHandler)
 
-	// Administrative routes for approvals, fleet control, and disputes.
+	// Administrative routes 
 	http.HandleFunc("/api/register", registerHandler)
 	http.HandleFunc("/api/create-asset", createAssetHandler)
 	http.HandleFunc("/api/update-asset", updateAssetHandler)
@@ -232,6 +226,7 @@ func main() {
 	http.HandleFunc("/api/update-profile", updateProfileHandler)
 	http.HandleFunc("/api/upload-avatar", uploadAvatarHandler)
 	http.HandleFunc("/api/reupload-license", reuploadLicenseHandler)
+	http.HandleFunc("/api/active-ride-status", getActiveRideStatusHandler)
 	http.HandleFunc("/api/my-vehicles", getMyVehiclesHandler)
 	http.HandleFunc("/api/host-stats", getHostStatsHandler)
 	http.HandleFunc("/api/transactions", getTransactionsHandler)
@@ -243,10 +238,11 @@ func main() {
 	http.HandleFunc("/api/rate-vehicle", rateVehicleHandler)
 	http.HandleFunc("/api/dispute-trip", disputeTripHandler)
 	http.HandleFunc("/api/admin/resolve-dispute", resolveDisputeHandler)
+
 	// Serve uploaded user and vehicle images.
 	http.Handle("/uploads/", http.StripPrefix("/uploads/", http.FileServer(http.Dir("uploads"))))
 
-	// Serve the compiled React Frontend (Change "./build" to "./dist" if you use Vite)
+	// Serve the compiled React Frontend
 	fs := http.FileServer(http.Dir("./dist"))
 	http.Handle("/", fs)
 
@@ -271,7 +267,7 @@ func initDB() {
 		log.Fatalf("Failed to enable foreign keys: %v", err)
 	}
 
-	// Backfill suspension and approval columns for older local databases.
+	// Backfill suspension and approval columns
 	db.Exec("ALTER TABLE vehicles ADD COLUMN admin_disabled BOOLEAN DEFAULT 0")
 	db.Exec("ALTER TABLE vehicles ADD COLUMN admin_reason TEXT")
 	db.Exec("ALTER TABLE users ADD COLUMN admin_disabled BOOLEAN DEFAULT 0")
@@ -342,7 +338,7 @@ func initDB() {
 		FOREIGN KEY(vehicle_id) REFERENCES vehicles(id)
 	);`
 	db.Exec(createTripsTable)
-	// Backfill trip bookkeeping columns used by reporting and dispute handling.
+	// Backfill trip bookkeeping columns
 	db.Exec("ALTER TABLE trips ADD COLUMN penalty_applied TEXT DEFAULT 'None'")
 	db.Exec("ALTER TABLE trips ADD COLUMN note TEXT DEFAULT ''")
 	db.Exec("ALTER TABLE trips ADD COLUMN exact_distance_km REAL DEFAULT 0.0") // Store the exact distance alongside the billed distance.
@@ -433,9 +429,7 @@ func initDB() {
 	log.Println("SQLite database initialized with the application schema")
 }
 
-// -----------------------------------------------------------------------------
-// 3. Authentication and shared helpers
-// -----------------------------------------------------------------------------
+// Auth and shared helpers
 
 func loginHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
@@ -463,7 +457,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	} else {
-		// Password validation happens in SQLite before the ledger is queried.
+		
 		var storedPassword string
 		err := db.QueryRow("SELECT password_hash FROM users WHERE id = ?", req.UserID).Scan(&storedPassword)
 		if err != nil || storedPassword != req.Password {
@@ -471,8 +465,7 @@ func loginHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// After the local password check passes, confirm that the user also exists
-		// on-chain. The built-in SQLite admin account is excluded from this step.
+		// Confirm that the user exists
 		if req.UserID != "admin" {
 			_, err = contract.EvaluateTransaction("GetUser", req.UserID)
 			if err != nil {
@@ -538,9 +531,7 @@ func enableCors(w *http.ResponseWriter) {
 	(*w).Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 }
 
-// -----------------------------------------------------------------------------
-// 4. API handlers
-// -----------------------------------------------------------------------------
+// API HANDLERS
 
 func getGeoJSONFeed(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
@@ -774,11 +765,11 @@ func rentAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject rentals for users who have not completed verification.
+	// CHECK IF USER IS VERIFIED BEFORE ALLOWING RENTAL
 	var isVerified bool
 	err := db.QueryRow("SELECT is_verified FROM users WHERE id = ?", effectiveUser).Scan(&isVerified)
 
-	// Stop here if the user record is missing or still unverified.
+	
 	if err != nil || !isVerified {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusForbidden)
@@ -802,14 +793,13 @@ func rentAssetHandler(w http.ResponseWriter, r *http.Request) {
 		json.Unmarshal(walletBytes, &wallet)
 
 		if wallet.TokenBalance < 10 {
-			w.WriteHeader(402) // 402 Payment Required
+			w.WriteHeader(402) 
 			w.Write([]byte(fmt.Sprintf(`{"error": "You need at least 10 credits to unlock a vehicle. Your current balance is %.2f credits."}`, wallet.TokenBalance)))
 			return
 		}
 	}
 
-	// Read the current trust threshold from admin settings before calling
-	// chaincode.
+	// Read the current trust threshold from admin settings 
 	var minTrustScore float64 = 2.5
 	var trustStr string
 	db.QueryRow("SELECT value FROM global_settings WHERE key = 'minTrustScore'").Scan(&trustStr)
@@ -825,7 +815,7 @@ func rentAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Open the ride on-chain.
+	// Submit the transaction to the blockchain to mark the asset as rented.
 	_, err = contract.SubmitTransaction("RentAsset", req.VehicleID, effectiveUser)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -852,8 +842,9 @@ func rentAssetHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte(`{"success": true, "message": "Vehicle unlocked successfully."}`))
 }
 
+// Haversine formula to calculate distance in meters between two lat/lon points.
 func calculateDistanceMeters(lat1, lon1, lat2, lon2 float64) float64 {
-	const R = 6371000 // Earth radius in meters
+	const R = 6371000 
 	phi1 := lat1 * math.Pi / 180
 	phi2 := lat2 * math.Pi / 180
 	deltaPhi := (lat2 - lat1) * math.Pi / 180
@@ -906,9 +897,7 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 	latMicroStr := strconv.FormatInt(toMicrodegrees(req.ReturnLat), 10)
 	lonMicroStr := strconv.FormatInt(toMicrodegrees(req.ReturnLon), 10)
 
-	// -----------------------------------------------------------------------------
 	// Estimate the ridden distance from trip duration.
-	// -----------------------------------------------------------------------------
 	endTime := time.Now().Unix()
 
 	durationSeconds := float64(endTime - asset.StartTime)
@@ -930,9 +919,7 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[ORACLE] Trip %s: %.2f mins, exact distance=%.2f km, billed distance=%s km\n", req.VehicleID, durationMinsFloat, exactDistanceKm, distanceStr)
 
-	// -----------------------------------------------------------------------------
 	// Estimate avoided emissions using the asset profile and the eco multiplier.
-	// -----------------------------------------------------------------------------
 	var vehicleEmissionRate int64
 	var fuelType string
 	err = db.QueryRow("SELECT co2_savings_rate, fuel_type FROM vehicles WHERE id = ?", req.VehicleID).Scan(&vehicleEmissionRate, &fuelType)
@@ -964,19 +951,15 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 	co2Saved := int64(math.Max(0, float64(baseline*passengers-vehicleEmissionRate)*exactDistanceKm*ecoMultiplier))
 	co2SavedStr := strconv.FormatInt(co2Saved, 10)
 
-	// -----------------------------------------------------------------------------
 	// Measure how far the vehicle was left from its base location.
-	// -----------------------------------------------------------------------------
 	baseLat := float64(asset.BaseLatMicro) / 1000000.0
 	baseLon := float64(asset.BaseLonMicro) / 1000000.0
 	parkedDistanceMeters := calculateDistanceMeters(baseLat, baseLon, req.ReturnLat, req.ReturnLon)
 	parkedDistanceStr := strconv.FormatInt(int64(math.Round(parkedDistanceMeters)), 10)
 
-	// -----------------------------------------------------------------------------
 	// Calculate the platform fee using the current admin setting.
-	// -----------------------------------------------------------------------------
 
-	var platformFeePercentage float64 = 5.0 // Default 5%
+	var platformFeePercentage float64 = 5.0 
 	var feeStr2 string
 	db.QueryRow("SELECT value FROM global_settings WHERE key = 'platformFee'").Scan(&feeStr2)
 	if parsed, err := strconv.ParseFloat(feeStr2, 64); err == nil {
@@ -993,7 +976,7 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 	platformFeeInt := int64(math.Round(platformFeeCRT))
 	platformFeeStr := strconv.FormatInt(platformFeeInt, 10)
 
-	// Submit all settlement inputs to chaincode in a single call.
+	// Submit all settlement inputs to chaincode
 	result, err := contract.SubmitTransaction("ReturnAsset", req.VehicleID, effectiveUser, latMicroStr, lonMicroStr, distanceStr, platformFeeStr, co2SavedStr, parkedDistanceStr)
 	if err != nil {
 		w.WriteHeader(400)
@@ -1003,10 +986,10 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 
 	blockchainTripID := string(result)
 
-	// Mirror the completed trip into SQLite, replacing the temporary live row.
+	// submit the completed trip to sqlite
 	if asset.StartTime > 0 {
 
-		// Reproduce the settlement locally so reporting stays aligned with chaincode.
+		// reproduce the settlement
 		var parkingFine float64 = 0
 		penaltyFlag := "None"
 
@@ -1023,7 +1006,7 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 
-		// Total cost equals the ride fare plus any parking fine.
+		// total cost
 		exactLedgerCost := rideFare + parkingFine
 
 		updateTripQuery := `
@@ -1033,11 +1016,10 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 		`
 		db.Exec(updateTripQuery, blockchainTripID, float64(billedDistance), exactDistanceKm, co2Saved, exactLedgerCost, penaltyFlag, req.VehicleID)
 
-		// Write the local double-entry wallet records used by the UI.
-		// Record the rider's fare payment.
+		// wallet records
 		db.Exec("INSERT INTO wallet_transactions (user_id, amount, tx_type, description) VALUES (?, ?, ?, ?)", effectiveUser, -rideFare, "TRIP_PAYMENT", fmt.Sprintf("Ride Fare for %s", req.VehicleID))
 
-		// Record the optional parking penalty on both sides of the ledger.
+		// Record any parking fine transactions
 		if parkingFine > 0 {
 			db.Exec("INSERT INTO wallet_transactions (user_id, amount, tx_type, description) VALUES (?, ?, ?, ?)", effectiveUser, -parkingFine, "PARKING_PENALTY", penaltyFlag)
 			db.Exec("INSERT INTO wallet_transactions (user_id, amount, tx_type, description) VALUES (?, ?, ?, ?)", "PlatformTreasury", parkingFine, "PARKING_PENALTY", penaltyFlag)
@@ -1054,6 +1036,7 @@ func returnAssetHandler(w http.ResponseWriter, r *http.Request) {
 		db.Exec(updateEcoQuery, co2Saved, exactDistanceKm, effectiveUser)
 
 		var currentMileageStr sql.NullString
+		//update vehicle mileage
 		err = db.QueryRow("SELECT mileage FROM vehicles WHERE id = ?", req.VehicleID).Scan(&currentMileageStr)
 		if err == nil && currentMileageStr.Valid {
 			cleanStr := strings.ReplaceAll(currentMileageStr.String, " km", "")
@@ -1273,8 +1256,7 @@ func getEcoStatsHandler(w http.ResponseWriter, r *http.Request) {
 		co2 = totalCO2.Float64
 	}
 
-	// Loyalty points come from chaincode, so fetch the authoritative value
-	// instead of deriving it locally.
+	// loyalty points are stored in the ledger
 	var loyaltyPoints int64 = 0
 	userBytes, _ := contract.EvaluateTransaction("GetUser", effectiveUser)
 	if userBytes != nil {
@@ -1289,7 +1271,51 @@ func getEcoStatsHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"totalTrips":    totalTrips,
 		"totalCo2Saved": co2,
-		"loyalty":       loyaltyPoints, // Pass the ledger value straight through to the frontend.
+		"loyalty":       loyaltyPoints, 
+	})
+}
+
+// getActiveRideStatusHandler returns the current in-progress ride
+func getActiveRideStatusHandler(w http.ResponseWriter, r *http.Request) {
+	enableCors(&w)
+	if r.Method == "OPTIONS" {
+		return
+	}
+
+	effectiveUser := getEffectiveUser(r)
+	if effectiveUser == "" {
+		http.Error(w, `{"error": "Please sign in to continue."}`, 401)
+		return
+	}
+
+	var tripID, vehicleID sql.NullString
+	err := db.QueryRow(`
+		SELECT id, vehicle_id
+		FROM trips
+		WHERE driver_id = ? AND status = 'In Progress'
+		ORDER BY start_time DESC
+		LIMIT 1
+	`, effectiveUser).Scan(&tripID, &vehicleID)
+
+	w.Header().Set("Content-Type", "application/json")
+
+	if err == sql.ErrNoRows {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"hasActiveRide": false,
+		})
+		return
+	}
+
+	if err != nil {
+		http.Error(w, `{"error": "We couldn't check your live trip right now."}`, 500)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"hasActiveRide": true,
+		"rideId":        tripID.String,
+		"vehicleId":     vehicleID.String,
+		"status":        "In Progress",
 	})
 }
 
@@ -1352,8 +1378,7 @@ func getHostStatsHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// Trip history for the current user, or for a selected user when requested
-// by an administrator.
+// Trip history for a user
 func getUserTripsHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
 	if r.Method == "OPTIONS" {
@@ -1363,12 +1388,11 @@ func getUserTripsHandler(w http.ResponseWriter, r *http.Request) {
 	effectiveUser := getEffectiveUser(r)
 	targetUser := effectiveUser
 
-	// Allow administrators to inspect another user's trip history.
 	queryId := r.URL.Query().Get("id")
 	if queryId != "" && (effectiveUser == "admin" || effectiveUser == "appUser") {
 		targetUser = queryId
 	} else if effectiveUser == "" {
-		targetUser = queryId // Fallback for testing
+		targetUser = queryId 
 	}
 
 	query := `
@@ -1538,9 +1562,7 @@ func rateVehicleHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
 }
 
-// -----------------------------------------------------------------------------
-// 5. Profile routes
-// -----------------------------------------------------------------------------
+// Profile related routes
 
 type ProfileResponse struct {
 	ID             string `json:"id"`
@@ -1734,7 +1756,7 @@ func updateAssetHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The frontend submits this file field as vehicleImage, so read that name here.
+	
 	file, handler, err := r.FormFile("vehicleImage")
 	var imagePath string
 	if err == nil {
@@ -1909,9 +1931,7 @@ func getMyVehiclesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(vehicles)
 }
 
-// -----------------------------------------------------------------------------
-// 6. Admin suspension and oversight routes
-// -----------------------------------------------------------------------------
+// Admin suspension and oversight functions
 
 func toggleAdminVehicleHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
@@ -2062,7 +2082,7 @@ func getAdminStatsHandler(w http.ResponseWriter, r *http.Request) {
 
 	totalPlatformRevenue := fees + penalties
 
-	// Treasury balance is authoritative on-chain, so read it from chaincode.
+	// Treasury balance is from the chaincode
 	treasuryBalance := 0.0
 	treasuryBytes, _ := contract.EvaluateTransaction("GetUser", "PlatformTreasury")
 	if treasuryBytes != nil {
@@ -2161,8 +2181,6 @@ func getAdminActiveUsersHandler(w http.ResponseWriter, r *http.Request) {
 			status = "SUSPENDED"
 		}
 
-		// Wallet balance and loyalty points are sourced from chaincode so the
-		// admin view reflects the canonical account state.
 		balance := 0.0
 		var loyalty int64 = 0
 		walletBytes, _ := contract.EvaluateTransaction("GetUser", id.String)
@@ -2343,8 +2361,7 @@ func approveAssetHandler(w http.ResponseWriter, r *http.Request) {
 	payloadBytes, _ := json.Marshal(payload)
 	_, mintErr := contract.SubmitTransaction("CreateAsset", string(payloadBytes))
 
-	// Approvals can be retried. If the asset is already on-chain, skip minting
-	// and continue with the approval step.
+	
 	if mintErr != nil {
 		if strings.Contains(mintErr.Error(), "already exist") {
 			log.Printf("[ApproveAsset] Vehicle %s already exists in Fabric. Skipping the create step.\n", req.VehicleID)
@@ -2583,7 +2600,6 @@ func disputeTripHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// Resolve a disputed trip by refunding it or marking the claim dismissed.
 func resolveDisputeHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
 	if r.Method == "OPTIONS" {
@@ -2625,7 +2641,6 @@ func resolveDisputeHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]bool{"success": true})
 }
 
-// List previously resolved or refunded disputes for the admin dashboard.
 func getAdminResolvedDisputesHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
 	if r.Method == "OPTIONS" {
@@ -2747,8 +2762,7 @@ func adminAddFleetVehicleHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true, "message": fmt.Sprintf("Fleet vehicle %s is now live!", payload.ID)})
 }
 
-// Return wallet transactions for the current user, with optional admin access
-// to another account.
+
 func getTransactionsHandler(w http.ResponseWriter, r *http.Request) {
 	enableCors(&w)
 	if r.Method == "OPTIONS" {
