@@ -1,8 +1,0 @@
-import{c as b,r as C,C as T,j as t,x as y,S as m,B as i,I as n,M as o,P as M,y as f,T as S,f as I,H as p}from"./index-ODYXt4nQ.js";import{M as H}from"./Map.esm-BIai659E.js";import{a as P,c as V,P as v}from"./print-BLR8d74T.js";const _=p.div`
-  margin-top: 5px;
-  a {
-    color: ${I[700]};
-  }
-`,k=p.div`
-  margin-top: 30px;
-`,r=class r extends C.Component{constructor(s){super(s),this._toggleMap=()=>{this.setState({mapVisible:!this.state.mapVisible})},this._print=()=>{window.print()},this.state={mapVisible:!0}}componentDidUpdate(){P()}componentWillUnmount(){V()}render(){const{config:s,header:x,itinerary:e,mapElement:h,onClose:l,subTitle:j="",title:g}=this.props,{LegIcon:u}=this.context,c=document.querySelector(".maplibregl-ctrl-attrib-inner")?.innerHTML;return t.jsxs("div",{className:"otp print-layout",children:[t.jsx(y,{title:[g,j]}),t.jsxs("div",{className:"header",children:[t.jsxs("div",{style:{float:"right"},children:[t.jsx(m,{margin:.25,children:t.jsx(i,{"aria-expanded":this.state.mapVisible,bsSize:"small",onClick:this._toggleMap,children:t.jsx(n,{Icon:H,children:t.jsx(o,{id:"components.PrintLayout.toggleMap"})})})}),t.jsx(m,{margin:.25,children:t.jsx(i,{bsSize:"small",onClick:this._print,children:t.jsx(n,{Icon:M,children:t.jsx(o,{id:"common.forms.print"})})})}),l&&t.jsx(i,{bsSize:"small",onClick:l,role:"link",children:t.jsx(n,{Icon:f,children:t.jsx(o,{id:"common.forms.close"})})})]}),x]}),this.state.mapVisible&&h,c&&t.jsx(_,{children:t.jsx("div",{dangerouslySetInnerHTML:{__html:c}})}),e&&t.jsxs(k,{children:[t.jsx(v,{config:s,itinerary:e,LegIcon:u}),t.jsx(S,{className:"percy-hide",itinerary:e})]})]})}};r.contextType=T;let a=r;const z=d=>({config:d.otp.config}),R=b(z)(a);export{R as T};

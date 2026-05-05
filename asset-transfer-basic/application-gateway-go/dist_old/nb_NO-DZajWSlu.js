@@ -1,1 +1,0 @@
-const e={otpUi:{EndpointsOverlay:{saveAsWork:"Lagre som arbeid",clearLocation:"Fjern som {locationType}-plassering",saveAsHome:"Lagre som hjem",forgetWork:"Glem arbeid",forgetHome:"Glem hjem"}}};export{e as default};

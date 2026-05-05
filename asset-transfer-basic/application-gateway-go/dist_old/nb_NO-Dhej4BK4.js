@@ -1,1 +1,0 @@
-const t={otpUi:{PrintableItinerary:{TncLeg:{header:"<strong>Ta {company}</strong> til <strong>{place}</strong>"},depart:"<strong>Avreise</strong> fra <strong>{place}</strong>"}}};export{t as default};
